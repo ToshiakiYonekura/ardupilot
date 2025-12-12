@@ -142,6 +142,14 @@ Mode *Copter::mode_from_mode_num(const Mode::Number mode)
             return (Mode *)g2.mode_systemid_ptr;
 #endif
 
+#if MODE_SMARTPHOTO_ENABLED
+        case Mode::Number::SYSTEM_ID:
+            return &mode_smartphoto;
+
+        case Mode::Number::SMART_PHOTO:
+            return &mode_smartphoto99;
+#endif
+
 #if MODE_AUTOROTATE_ENABLED
         case Mode::Number::AUTOROTATE:
             return &mode_autorotate;
@@ -206,6 +214,8 @@ bool Copter::gcs_mode_enabled(const Mode::Number mode_num)
         (uint8_t)Mode::Number::FOLLOW,
         (uint8_t)Mode::Number::ZIGZAG,
         (uint8_t)Mode::Number::SYSTEMID,
+        (uint8_t)Mode::Number::SYSTEM_ID,
+        (uint8_t)Mode::Number::SMART_PHOTO,
         (uint8_t)Mode::Number::AUTOROTATE,
         (uint8_t)Mode::Number::AUTO_RTL,
         (uint8_t)Mode::Number::TURTLE

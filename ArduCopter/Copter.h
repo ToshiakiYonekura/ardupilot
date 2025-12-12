@@ -177,6 +177,10 @@
 #include "UserParameters.h"
 #endif
 #include "mode.h"
+#if MODE_SMARTPHOTO_ENABLED
+#include "mode_smartphoto.h"
+#include "mode_smartphoto99.h"
+#endif
 
 class Copter : public AP_Vehicle {
 public:
@@ -219,6 +223,8 @@ public:
     friend class ModePosHold;
     friend class ModeRTL;
     friend class ModeSmartRTL;
+    friend class ModeSmartPhoto;
+    friend class ModeSmartPhoto99;
     friend class ModeSport;
     friend class ModeStabilize;
     friend class ModeStabilize_Heli;
@@ -1089,6 +1095,10 @@ private:
 #endif
 #if MODE_SMARTRTL_ENABLED
     ModeSmartRTL mode_smartrtl;
+#endif
+#if MODE_SMARTPHOTO_ENABLED
+    ModeSmartPhoto mode_smartphoto;
+    ModeSmartPhoto99 mode_smartphoto99;
 #endif
 #if MODE_FLOWHOLD_ENABLED
     ModeFlowHold mode_flowhold;

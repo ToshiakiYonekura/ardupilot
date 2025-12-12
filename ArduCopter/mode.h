@@ -103,7 +103,8 @@ public:
         TURTLE =       28,  // Flip over after crash
 
         // Mode number 30 reserved for "offboard" for external/lua control.
-
+        SYSTEM_ID =     98,  // 追加
+        SMART_PHOTO =   99,  // 追加
         // Mode number 127 reserved for the "drone show mode" in the Skybrush
         // fork at https://github.com/skybrush-io/ardupilot
     };
