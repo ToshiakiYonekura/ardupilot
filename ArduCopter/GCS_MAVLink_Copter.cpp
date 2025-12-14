@@ -574,6 +574,13 @@ MAV_RESULT GCS_MAVLINK_Copter::handle_command_int_packet(const mavlink_command_i
 
     case MAV_CMD_NAV_VTOL_LAND:
     case MAV_CMD_NAV_LAND:
+#if MODE_SMARTPHOTO_ENABLED
+        // Check if in Mode 99 - use mission landing sequence instead of mode switch
+        if (copter.flightmode->mode_number() == Mode::Number::SMART_PHOTO) {
+            copter.mode_smartphoto99.command_landing();
+            return MAV_RESULT_ACCEPTED;
+        }
+#endif
         if (!copter.set_mode(Mode::Number::LAND, ModeReason::GCS_COMMAND)) {
             return MAV_RESULT_FAILED;
         }
@@ -591,6 +598,19 @@ MAV_RESULT GCS_MAVLINK_Copter::handle_command_int_packet(const mavlink_command_i
             return MAV_RESULT_ACCEPTED;
         }
         return MAV_RESULT_FAILED;
+#endif
+
+#if MODE_SMARTPHOTO_ENABLED
+    // Mode 99 (SmartPhoto99) mission sequence commands
+    case MAV_CMD_USER_1: {
+        // Mission ready signal from companion computer
+        bool in_mode99 = (copter.flightmode->mode_number() == Mode::Number::SMART_PHOTO);
+        if (in_mode99) {
+            copter.mode_smartphoto99.set_mission_ready();
+            return MAV_RESULT_ACCEPTED;
+        }
+        return MAV_RESULT_FAILED;
+    }
 #endif
 
     default:
