@@ -1033,8 +1033,15 @@ void GCS_MAVLINK_Copter::handle_message_set_position_target_local_ned(const mavl
     mavlink_set_position_target_local_ned_t packet;
     mavlink_msg_set_position_target_local_ned_decode(&msg, &packet);
 
-    // exit if vehicle is not in Guided mode or Auto-Guided mode
-    if (!copter.flightmode->in_guided_mode()) {
+#if MODE_SMARTPHOTO_ENABLED
+    // Check if we're in mode 99 (SmartPhoto99) - allow companion computer control
+    bool in_mode99 = (copter.flightmode->mode_number() == Mode::Number::SMART_PHOTO);
+#else
+    bool in_mode99 = false;
+#endif
+
+    // exit if vehicle is not in Guided mode, Auto-Guided mode, or Mode 99
+    if (!copter.flightmode->in_guided_mode() && !in_mode99) {
         return;
     }
 
@@ -1125,17 +1132,65 @@ void GCS_MAVLINK_Copter::handle_message_set_position_target_local_ned(const mavl
     }
 
     // send request
-    if (!pos_ignore && !vel_ignore) {
-        copter.mode_guided.set_pos_vel_accel_NEU_m(pos_neu_m, vel_neu_ms, accel_neu_mss, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative);
-    } else if (pos_ignore && !vel_ignore) {
-        copter.mode_guided.set_vel_accel_NEU_m(vel_neu_ms, accel_neu_mss, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative);
-    } else if (pos_ignore && vel_ignore && !acc_ignore) {
-        copter.mode_guided.set_accel_NEU_mss(accel_neu_mss, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative);
-    } else if (!pos_ignore && vel_ignore && acc_ignore) {
-        copter.mode_guided.set_pos_NEU_m(pos_neu_m, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative, false);
-    } else {
-        // input is not valid so stop
-        copter.mode_guided.init(true);
+#if MODE_SMARTPHOTO_ENABLED
+    if (in_mode99) {
+        // Route to mode 99 for companion computer control
+        // Convert NEU (North-East-Up) to NED (North-East-Down) frame
+        Vector3f pos_ned, vel_ned;
+
+        if (!pos_ignore) {
+            pos_ned.x = pos_neu_m.x;
+            pos_ned.y = pos_neu_m.y;
+            pos_ned.z = -pos_neu_m.z;  // Convert Up to Down
+        } else {
+            // If position ignored, use current position
+            Vector3p current_pos_ned;
+            if (AP::ahrs().get_relative_position_NED_origin(current_pos_ned)) {
+                pos_ned.x = current_pos_ned.x;
+                pos_ned.y = current_pos_ned.y;
+                pos_ned.z = current_pos_ned.z;
+            } else {
+                pos_ned.zero();
+            }
+        }
+
+        if (!vel_ignore) {
+            vel_ned.x = vel_neu_ms.x;
+            vel_ned.y = vel_neu_ms.y;
+            vel_ned.z = -vel_neu_ms.z;  // Convert Up to Down
+        } else {
+            vel_ned.zero();
+        }
+
+        // Handle yaw (all in radians)
+        float yaw_target = yaw_rad;  // [radians]
+        if (yaw_ignore) {
+            yaw_target = copter.ahrs.get_yaw();  // Use current yaw [radians]
+        } else if (yaw_relative) {
+            yaw_target = wrap_PI(copter.ahrs.get_yaw() + yaw_rad);  // [radians]
+        }
+
+        float yaw_rate = yaw_rate_ignore ? 0.0f : yaw_rate_rads;  // [rad/s]
+
+        // Update mode 99 with companion command
+        // Units: pos_ned [meters], vel_ned [m/s], yaw_target [radians], yaw_rate [rad/s]
+        copter.mode_smartphoto99.update_companion_command(pos_ned, vel_ned, yaw_target, yaw_rate);
+    } else
+#endif
+    {
+        // Standard guided mode handling
+        if (!pos_ignore && !vel_ignore) {
+            copter.mode_guided.set_pos_vel_accel_NEU_m(pos_neu_m, vel_neu_ms, accel_neu_mss, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative);
+        } else if (pos_ignore && !vel_ignore) {
+            copter.mode_guided.set_vel_accel_NEU_m(vel_neu_ms, accel_neu_mss, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative);
+        } else if (pos_ignore && vel_ignore && !acc_ignore) {
+            copter.mode_guided.set_accel_NEU_mss(accel_neu_mss, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative);
+        } else if (!pos_ignore && vel_ignore && acc_ignore) {
+            copter.mode_guided.set_pos_NEU_m(pos_neu_m, !yaw_ignore, yaw_rad, !yaw_rate_ignore, yaw_rate_rads, yaw_relative, false);
+        } else {
+            // input is not valid so stop
+            copter.mode_guided.init(true);
+        }
     }
 }
 
