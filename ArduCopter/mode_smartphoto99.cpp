@@ -81,6 +81,21 @@ void ModeSmartPhoto99::run() {
     // Get current EKF states
     get_ekf_states();
 
+    // Get wind speed detection from EKF wind estimate
+    Vector3f wind_vec;
+    if (ahrs.wind_estimate(wind_vec)) {
+        // Wind estimate available from EKF
+        // wind_vec is in NED frame (North, East, Down) in m/s
+        float wind_speed = wind_vec.xy().length();            // Horizontal wind speed (m/s)
+        float wind_dir = atan2f(wind_vec.y, wind_vec.x);      // Wind direction (radians, 0 = from North)
+
+        // Output wind data via GCS telemetry (can be received by companion computer)
+        gcs().send_named_float("WindSpd", wind_speed);
+        gcs().send_named_float("WindDir", degrees(wind_dir));
+        gcs().send_named_float("WindN", wind_vec.x);  // North component
+        gcs().send_named_float("WindE", wind_vec.y);  // East component
+    }
+
     // Update reference trajectory from pilot input
     // Get pilot desired climb rate
     float target_climb_rate_ms = get_pilot_desired_climb_rate_ms();

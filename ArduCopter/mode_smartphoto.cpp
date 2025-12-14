@@ -111,7 +111,7 @@ void ModeSmartPhoto::run() {
             } else {
                 // Set target altitude and climb at 0.5 m/s
                 target_climb_rate_ms = 0.5f;
-                copter.pos_control->set_pos_target_U_from_climb_rate_m(target_climb_rate_ms);
+                copter.pos_control->set_pos_target_U_from_climb_rate_ms(target_climb_rate_ms);
             }
             break;
 
@@ -122,7 +122,7 @@ void ModeSmartPhoto::run() {
                 transition_to_state(State::SYSID_ROLL);
             } else {
                 // Hold altitude
-                copter.pos_control->set_pos_target_U_from_climb_rate_m(0.0f);
+                copter.pos_control->set_pos_target_U_from_climb_rate_ms(0.0f);
             }
             break;
 
@@ -160,7 +160,7 @@ void ModeSmartPhoto::run() {
                 transition_to_state(State::RTL);
             }
             // Hold altitude
-            copter.pos_control->set_pos_target_U_from_climb_rate_m(0.0f);
+            copter.pos_control->set_pos_target_U_from_climb_rate_ms(0.0f);
             break;
 
         case State::RTL:
@@ -215,7 +215,7 @@ void ModeSmartPhoto::execute_sysid_maneuver() {
 
         case State::SYSID_THROTTLE:
             // Throttle pulse (add to base altitude hold)
-            copter.pos_control->set_pos_target_U_from_climb_rate_m(
+            copter.pos_control->set_pos_target_U_from_climb_rate_ms(
                 0.1f * sinf(2.0f * M_PI * freq * time_in_state));
             break;
 
@@ -224,7 +224,7 @@ void ModeSmartPhoto::execute_sysid_maneuver() {
     }
 
     // Maintain altitude
-    copter.pos_control->set_pos_target_U_from_climb_rate_m(0.0f);
+    copter.pos_control->set_pos_target_U_from_climb_rate_ms(0.0f);
 
     // Apply attitude command
     copter.attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_rad(
