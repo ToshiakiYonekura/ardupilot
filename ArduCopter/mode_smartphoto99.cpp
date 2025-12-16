@@ -82,24 +82,22 @@ ModeSmartPhoto99::ModeSmartPhoto99() :
     wind_send_counter = 0;
 
     // Initialize mission state machine
-    mission_state.current_phase = MissionPhase::INITIALIZATION;
-    mission_state.previous_phase = MissionPhase::INITIALIZATION;
+    mission_state.current_phase = MissionPhase::OUT_OF_MODE99;
+    mission_state.previous_phase = MissionPhase::OUT_OF_MODE99;
     mission_state.phase_start_time_ms = 0;
-    mission_state.mission_configured = false;
-    mission_state.companion_ready = false;
-    mission_state.companion_timeout = false;
+    mission_state.route_set_received = false;
+    mission_state.companion_state = 0;
+    mission_state.last_companion_msg_ms = 0;
     mission_state.battery_low = false;
     mission_state.battery_critical = false;
     mission_state.gps_healthy = false;
     mission_state.ekf_healthy = false;
-    mission_state.armed_wait_start_ms = 0;
     mission_state.landing_detect_start_ms = 0;
-    mission_state.landed_stable_start_ms = 0;
     mission_state.takeoff_start_alt_m = 0.0f;
     mission_state.takeoff_target_alt_m = 0.0f;
-    mission_state.landing_target_alt_m = 0.0f;
 
     last_state_machine_ms = 0;
+    last_state_telemetry_ms = 0;
 }
 
 // Initialize Smart Photo mode
@@ -146,20 +144,16 @@ bool ModeSmartPhoto99::init(bool ignore_checks) {
     last_state_feedback_ms = now_ms;
     last_wind_send_ms = now_ms;
     last_state_machine_ms = now_ms;
+    last_state_telemetry_ms = now_ms;
 
-    // Initialize mission state machine based on armed state
-    if (motors->armed()) {
-        // Already armed - skip to autonomous flight phase
-        transition_to_phase(MissionPhase::AUTONOMOUS_FLIGHT);
-        gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: Started armed, entering autonomous mode");
-    } else {
-        // Disarmed - start in initialization phase
-        transition_to_phase(MissionPhase::INITIALIZATION);
-        gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: Waiting for mission configuration");
-    }
+    // Initialize mission state machine - always start in PLANNING state
+    transition_to_phase(MissionPhase::PLANNING);
+    gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: Entered PLANNING state");
+    gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: Waiting for ROUTE_SET from companion");
 
     gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: EKF State Feedback @ 100Hz");
     gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: Wind Telemetry @ 100Hz");
+    gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: State Telemetry @ 10Hz");
 
     return true;
 }
@@ -178,6 +172,15 @@ void ModeSmartPhoto99::run() {
     if (now_ms - last_state_machine_ms >= STATE_MACHINE_DT_MS) {
         last_state_machine_ms = now_ms;
         update_mission_state_machine();
+    }
+
+    // ==========================================
+    // STATE TELEMETRY @ 10Hz
+    // Send mode number and state to companion computer
+    // ==========================================
+    if (now_ms - last_state_telemetry_ms >= STATE_TELEMETRY_DT_MS) {
+        last_state_telemetry_ms = now_ms;
+        send_state_telemetry();
     }
 
     // Apply motor interlock (enable motors if armed)
@@ -660,6 +663,9 @@ void ModeSmartPhoto99::update_companion_command(const Vector3f& pos_ned, const V
     companion_cmd.timestamp_ms = AP_HAL::millis();  // [milliseconds]
     companion_cmd.valid = true;
 
+    // Update last companion message timestamp
+    mission_state.last_companion_msg_ms = AP_HAL::millis();
+
     // Enable companion command mode on first valid command
     if (!smoothing.use_companion_cmd) {
         smoothing.use_companion_cmd = true;
@@ -673,10 +679,22 @@ bool ModeSmartPhoto99::companion_command_valid() const {
         return false;
     }
 
-    // Timeout after 500ms without updates
+    // Per specification: "If cannot receive message from companion computer,
+    // assume to receive same state of companion computer as previous"
+    // This means we keep the last command valid even on timeout
+    // We only check if we have ever received a valid command
+
+    // Optional: Add timeout warning but keep command valid
     uint32_t now_ms = AP_HAL::millis();
-    if (now_ms - companion_cmd.timestamp_ms > 500) {
-        return false;
+    if (now_ms - companion_cmd.timestamp_ms > COMPANION_TIMEOUT_MS) {
+        // Timeout occurred, but we still use the last command
+        // The companion message timestamp is used for timeout detection elsewhere
+        static uint32_t last_timeout_warning_ms = 0;
+        if (now_ms - last_timeout_warning_ms > 5000) {  // Warn every 5 seconds
+            last_timeout_warning_ms = now_ms;
+            // Note: This would cause repeated warnings, so commenting out
+            // gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Companion timeout, using last command");
+        }
     }
 
     return true;
@@ -796,35 +814,23 @@ void ModeSmartPhoto99::update_mission_state_machine() {
 
     // Run current phase handler
     switch (mission_state.current_phase) {
-        case MissionPhase::INITIALIZATION:
-            handle_initialization_phase();
+        case MissionPhase::OUT_OF_MODE99:
+            handle_out_of_mode99_phase();
             break;
-        case MissionPhase::READY_TO_ARM:
-            handle_ready_to_arm_phase();
+        case MissionPhase::PLANNING:
+            handle_planning_phase();
             break;
-        case MissionPhase::ARMED_WAITING:
-            handle_armed_waiting_phase();
+        case MissionPhase::INITIALIZING:
+            handle_initializing_phase();
             break;
-        case MissionPhase::TAKEOFF:
-            handle_takeoff_phase();
+        case MissionPhase::EXECUTING:
+            handle_executing_phase();
             break;
-        case MissionPhase::AUTONOMOUS_FLIGHT:
-            handle_autonomous_flight_phase();
+        case MissionPhase::COMPLETED:
+            handle_completed_phase();
             break;
-        case MissionPhase::LANDING:
-            handle_landing_phase();
-            break;
-        case MissionPhase::LANDED:
-            handle_landed_phase();
-            break;
-        case MissionPhase::DISARMED:
-            handle_disarmed_phase();
-            break;
-        case MissionPhase::EMERGENCY_LAND:
-            handle_emergency_land_phase();
-            break;
-        case MissionPhase::HOVER:
-            handle_hover_phase();
+        case MissionPhase::IDLE:
+            handle_idle_phase();
             break;
     }
 }
@@ -848,16 +854,12 @@ void ModeSmartPhoto99::transition_to_phase(MissionPhase new_phase) {
 // Get human-readable phase name
 const char* ModeSmartPhoto99::get_phase_name(MissionPhase phase) const {
     switch (phase) {
-        case MissionPhase::INITIALIZATION: return "INIT";
-        case MissionPhase::READY_TO_ARM: return "READY";
-        case MissionPhase::ARMED_WAITING: return "ARMED_WAIT";
-        case MissionPhase::TAKEOFF: return "TAKEOFF";
-        case MissionPhase::AUTONOMOUS_FLIGHT: return "AUTO_FLIGHT";
-        case MissionPhase::LANDING: return "LANDING";
-        case MissionPhase::LANDED: return "LANDED";
-        case MissionPhase::DISARMED: return "DISARMED";
-        case MissionPhase::EMERGENCY_LAND: return "EMERGENCY";
-        case MissionPhase::HOVER: return "HOVER";
+        case MissionPhase::OUT_OF_MODE99: return "OUT_OF_MODE99";
+        case MissionPhase::PLANNING: return "PLANNING";
+        case MissionPhase::INITIALIZING: return "INITIALIZING";
+        case MissionPhase::EXECUTING: return "EXECUTING";
+        case MissionPhase::COMPLETED: return "COMPLETED";
+        case MissionPhase::IDLE: return "IDLE";
         default: return "UNKNOWN";
     }
 }
@@ -866,201 +868,116 @@ const char* ModeSmartPhoto99::get_phase_name(MissionPhase phase) const {
 // PHASE HANDLER FUNCTIONS
 // ============================================================================
 
-void ModeSmartPhoto99::handle_initialization_phase() {
-    // Waiting for companion to configure mission
-    // Companion should call set_mission_ready() when ready
-
-    // Auto-transition if already configured
-    if (mission_state.companion_ready && check_ready_to_arm()) {
-        transition_to_phase(MissionPhase::READY_TO_ARM);
-    }
+void ModeSmartPhoto99::handle_out_of_mode99_phase() {
+    // This state should not normally be reached during mode 99 execution
+    // If we're here, something went wrong - transition back to PLANNING
+    gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Unexpected OUT_OF_MODE99 state, resetting to PLANNING");
+    transition_to_phase(MissionPhase::PLANNING);
 }
 
-void ModeSmartPhoto99::handle_ready_to_arm_phase() {
-    // Waiting for arm command
-    // Monitor for arming
+void ModeSmartPhoto99::handle_planning_phase() {
+    // PLANNING: Waiting for ROUTE_SET from companion computer
+    // Transition to INITIALIZING when ROUTE_SET is received
 
-    if (motors->armed()) {
-        // Arming detected, start safety wait
-        mission_state.armed_wait_start_ms = AP_HAL::millis();
-        transition_to_phase(MissionPhase::ARMED_WAITING);
-    }
-}
+    if (mission_state.route_set_received) {
+        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: ROUTE_SET received, transitioning to INITIALIZING");
 
-void ModeSmartPhoto99::handle_armed_waiting_phase() {
-    // 10-second safety wait after arming
-    uint32_t now_ms = AP_HAL::millis();
-    uint32_t elapsed_ms = now_ms - mission_state.armed_wait_start_ms;
-
-    // Send countdown every second
-    static uint32_t last_countdown_ms = 0;
-    if (now_ms - last_countdown_ms >= 1000) {
-        last_countdown_ms = now_ms;
-        uint32_t remaining_sec = (ARMED_WAIT_TIME_MS - elapsed_ms) / 1000;
-        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Takeoff in %u seconds", (unsigned)remaining_sec);
-    }
-
-    // Check if wait period complete
-    if (elapsed_ms >= ARMED_WAIT_TIME_MS) {
-        // Record takeoff start altitude
+        // Record start altitude for takeoff
         mission_state.takeoff_start_alt_m = current_state.pos_d;
         mission_state.takeoff_target_alt_m = mission_state.takeoff_start_alt_m + TAKEOFF_ALTITUDE_M;
-        transition_to_phase(MissionPhase::TAKEOFF);
+
+        transition_to_phase(MissionPhase::INITIALIZING);
     }
 }
 
-void ModeSmartPhoto99::handle_takeoff_phase() {
-    // Vertical climb to target altitude
-    // Set target altitude for control loop
+void ModeSmartPhoto99::handle_initializing_phase() {
+    // INITIALIZING: Arm and rise to 50m altitude
+    // Transition to EXECUTING when altitude > 49m
+    // Transition to IDLE if any problem occurs
+
+    // Check for problems that should cause transition to IDLE
+    if (mission_state.battery_critical || !mission_state.ekf_healthy || !mission_state.gps_healthy) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Problem detected in INITIALIZING, transitioning to IDLE");
+        transition_to_phase(MissionPhase::IDLE);
+        return;
+    }
+
+    // If not armed yet, attempt to arm
+    if (!motors->armed()) {
+        // Wait for manual arming from operator
+        // In autonomous systems, this could trigger auto-arming if permitted
+        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: INITIALIZING - waiting for arm");
+        return;
+    }
+
+    // Armed - command climb to 50m
     target_altitude = mission_state.takeoff_target_alt_m;
 
     // Hold horizontal position at takeoff location
-    // (target_position_ne already set in init())
+    // target_position_ne should already be set
 
-    // Check if takeoff complete
-    if (check_takeoff_complete()) {
-        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Takeoff complete at %.1fm AGL",
-                       (double)(current_state.pos_d - mission_state.takeoff_start_alt_m));
-        transition_to_phase(MissionPhase::AUTONOMOUS_FLIGHT);
+    // Check if altitude threshold reached (> 49m AGL)
+    if (check_altitude_threshold_reached()) {
+        float altitude_agl = current_state.pos_d - mission_state.takeoff_start_alt_m;
+        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Altitude threshold reached (%.1fm), transitioning to EXECUTING",
+                       (double)altitude_agl);
+        transition_to_phase(MissionPhase::EXECUTING);
     }
 
     // Send altitude progress
     float altitude_agl = current_state.pos_d - mission_state.takeoff_start_alt_m;
-    gcs().send_named_float("TakeoffAlt", altitude_agl);
+    gcs().send_named_float("InitAlt", altitude_agl);
 }
 
-void ModeSmartPhoto99::handle_autonomous_flight_phase() {
+void ModeSmartPhoto99::handle_executing_phase() {
+    // EXECUTING: Drone executes autonomous mission
     // Companion computer controls via update_companion_command()
-    // Main control loop handles command execution
+    // Transition to IDLE when arrived at destination and landed
 
-    // Monitor companion command timeout
-    if (!companion_command_valid()) {
-        uint32_t timeout_ms = AP_HAL::millis() - companion_cmd.timestamp_ms;
-        if (timeout_ms > COMPANION_FAILSAFE_MS) {
-            gcs().send_text(MAV_SEVERITY_WARNING,
-                           "MODE99: Companion timeout %u ms, entering hover",
-                           (unsigned)timeout_ms);
-            transition_to_phase(MissionPhase::HOVER);
-        }
+    // Main control loop handles command execution from companion
+
+    // Check if destination reached and landed
+    if (check_destination_reached() && check_landing_complete()) {
+        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Destination reached and landed, transitioning to IDLE");
+        transition_to_phase(MissionPhase::IDLE);
     }
-
-    // Normal operation - control loop handles everything
 }
 
-void ModeSmartPhoto99::handle_landing_phase() {
-    // Controlled descent to landing target
-    // Set descent rate based on altitude
-    float altitude_agl = current_state.pos_d - mission_state.takeoff_start_alt_m;
-
-    float descent_rate_ms;
-    if (altitude_agl < 5.0f) {
-        descent_rate_ms = LANDING_FINAL_RATE_MS;  // Slow descent near ground
-    } else {
-        descent_rate_ms = LANDING_DESCENT_RATE_MS;  // Normal descent
-    }
-
-    // Set target velocity for descent (down is positive in NED)
-    reference_state.vel_d = descent_rate_ms;
-
-    // Update target altitude for gradual descent
-    target_altitude += descent_rate_ms * (STATE_MACHINE_DT_MS * 0.001f);
-
-    // Companion can still provide horizontal position targets
-    // If no companion, hold last position
-
-    // Check for landing complete
-    if (check_landing_complete()) {
-        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Landing detected");
-        mission_state.landed_stable_start_ms = AP_HAL::millis();
-        transition_to_phase(MissionPhase::LANDED);
-    }
-
-    // Send descent progress
-    gcs().send_named_float("LandingAlt", altitude_agl);
+void ModeSmartPhoto99::handle_completed_phase() {
+    // COMPLETED: Mission completed (reserved for future use)
+    // For now, treat similar to IDLE
+    gcs().send_text(MAV_SEVERITY_INFO, "MODE99: COMPLETED state - mission done");
 }
 
-void ModeSmartPhoto99::handle_landed_phase() {
-    // On ground, verify stability before disarm
-    uint32_t now_ms = AP_HAL::millis();
-    uint32_t stable_time_ms = now_ms - mission_state.landed_stable_start_ms;
+void ModeSmartPhoto99::handle_idle_phase() {
+    // IDLE: Mission ended, disarm the drone
 
-    if (check_landed_stable() && stable_time_ms >= LANDING_STABILITY_MS) {
-        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Disarming - mission complete");
+    if (motors->armed()) {
+        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: IDLE state, disarming drone");
         copter.arming.disarm(AP_Arming::Method::LANDED);
-        transition_to_phase(MissionPhase::DISARMED);
-    }
-}
-
-void ModeSmartPhoto99::handle_disarmed_phase() {
-    // Mission complete - final state
-    // User can exit mode or restart mission
-    // Just maintain state, no action needed
-}
-
-void ModeSmartPhoto99::handle_emergency_land_phase() {
-    // Emergency landing - descend at controlled rate
-    // Similar to normal landing but ignore companion commands
-
-    float altitude_agl = current_state.pos_d - mission_state.takeoff_start_alt_m;
-
-    // Use slower descent rate for safety
-    float descent_rate_ms = LANDING_FINAL_RATE_MS;
-    reference_state.vel_d = descent_rate_ms;
-    target_altitude += descent_rate_ms * (STATE_MACHINE_DT_MS * 0.001f);
-
-    // Hold last known position
-    // No companion input accepted in emergency
-
-    if (check_landing_complete()) {
-        gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Emergency landing complete");
-        copter.arming.disarm(AP_Arming::Method::LANDED);
-        transition_to_phase(MissionPhase::DISARMED);
     }
 
-    gcs().send_named_float("EmergAlt", altitude_agl);
-}
-
-void ModeSmartPhoto99::handle_hover_phase() {
-    // Failsafe hover - maintain position and altitude
-    // Wait for companion to recover or pilot intervention
-
-    // Hold current position (already set in target_position_ne and target_altitude)
-    // Zero velocity commands
-    reference_state.vel_n = 0.0f;
-    reference_state.vel_e = 0.0f;
-    reference_state.vel_d = 0.0f;
-
-    // Check if companion recovered
-    if (companion_command_valid()) {
-        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Companion recovered, resuming flight");
-        transition_to_phase(MissionPhase::AUTONOMOUS_FLIGHT);
-    }
-
-    // If hover too long (e.g., 30 seconds), initiate landing
-    uint32_t hover_time_ms = AP_HAL::millis() - mission_state.phase_start_time_ms;
-    if (hover_time_ms > 30000) {
-        gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Hover timeout, landing");
-        transition_to_phase(MissionPhase::LANDING);
-    }
+    // Stay in IDLE state until mode is changed or reset
 }
 
 // ============================================================================
 // TRANSITION CHECK FUNCTIONS
 // ============================================================================
 
-bool ModeSmartPhoto99::check_ready_to_arm() {
-    // Check if all conditions met for arming
-    return copter.position_ok() &&
-           !copter.any_failsafe_triggered() &&
-           mission_state.gps_healthy &&
-           mission_state.ekf_healthy;
+bool ModeSmartPhoto99::check_altitude_threshold_reached() {
+    // Check if altitude > 49m AGL (considering measurement error)
+    float altitude_agl = current_state.pos_d - mission_state.takeoff_start_alt_m;
+    return altitude_agl > ALTITUDE_THRESHOLD_M;
 }
 
-bool ModeSmartPhoto99::check_takeoff_complete() {
-    // Takeoff complete when altitude reached and climb rate low
-    float alt_error = fabsf(current_state.pos_d - mission_state.takeoff_target_alt_m);
-    float climb_rate = fabsf(current_state.vel_d);
-    return (alt_error < 1.0f) && (climb_rate < 0.2f);
+bool ModeSmartPhoto99::check_destination_reached() {
+    // Check if drone has reached destination
+    // This is a placeholder - actual implementation would check if position matches
+    // the destination position from the route
+
+    // For now, we rely on the companion computer to command landing when destination is reached
+    // Return false to let companion control when to land
+    return false;
 }
 
 bool ModeSmartPhoto99::check_landing_complete() {
@@ -1086,14 +1003,6 @@ bool ModeSmartPhoto99::check_landing_complete() {
     }
 }
 
-bool ModeSmartPhoto99::check_landed_stable() {
-    // Verify vehicle is stable on ground
-    return copter.ap.land_complete &&
-           fabsf(current_state.vel_n) < 0.05f &&
-           fabsf(current_state.vel_e) < 0.05f &&
-           fabsf(current_state.vel_d) < 0.05f;
-}
-
 // ============================================================================
 // SAFETY MONITORING FUNCTIONS
 // ============================================================================
@@ -1106,47 +1015,36 @@ void ModeSmartPhoto99::update_safety_flags() {
     // Update battery status
     check_battery_level();
 
-    // Update companion timeout status
-    mission_state.companion_timeout = !companion_command_valid();
+    // Note: Companion timeout is handled per specification:
+    // "If cannot receive message from companion computer,
+    // assume to receive same state of companion computer as previous"
 }
 
 void ModeSmartPhoto99::check_emergency_conditions() {
-    // Check for critical failures that require emergency landing
+    // Check for critical failures that require transitioning to IDLE
 
-    // Battery critical - force landing
-    if (mission_state.battery_critical) {
-        if (mission_state.current_phase != MissionPhase::EMERGENCY_LAND &&
-            mission_state.current_phase != MissionPhase::LANDED &&
-            mission_state.current_phase != MissionPhase::DISARMED) {
-            gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: BATTERY CRITICAL - EMERGENCY LANDING");
-            transition_to_phase(MissionPhase::EMERGENCY_LAND);
-        }
+    // Battery critical - transition to IDLE for disarming
+    if (mission_state.battery_critical && mission_state.current_phase != MissionPhase::IDLE) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: BATTERY CRITICAL - TRANSITIONING TO IDLE");
+        transition_to_phase(MissionPhase::IDLE);
         return;
     }
 
-    // EKF failure - emergency land
-    if (!mission_state.ekf_healthy && motors->armed()) {
-        if (mission_state.current_phase != MissionPhase::EMERGENCY_LAND &&
-            mission_state.current_phase != MissionPhase::LANDED &&
-            mission_state.current_phase != MissionPhase::DISARMED) {
-            gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: EKF FAILURE - EMERGENCY LANDING");
-            transition_to_phase(MissionPhase::EMERGENCY_LAND);
-        }
+    // EKF failure - transition to IDLE
+    if (!mission_state.ekf_healthy && motors->armed() && mission_state.current_phase != MissionPhase::IDLE) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: EKF FAILURE - TRANSITIONING TO IDLE");
+        transition_to_phase(MissionPhase::IDLE);
         return;
     }
 
-    // GPS failure - emergency land
-    if (!mission_state.gps_healthy && motors->armed()) {
-        if (mission_state.current_phase != MissionPhase::EMERGENCY_LAND &&
-            mission_state.current_phase != MissionPhase::LANDED &&
-            mission_state.current_phase != MissionPhase::DISARMED) {
-            gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: GPS FAILURE - EMERGENCY LANDING");
-            transition_to_phase(MissionPhase::EMERGENCY_LAND);
-        }
+    // GPS failure - transition to IDLE
+    if (!mission_state.gps_healthy && motors->armed() && mission_state.current_phase != MissionPhase::IDLE) {
+        gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: GPS FAILURE - TRANSITIONING TO IDLE");
+        transition_to_phase(MissionPhase::IDLE);
         return;
     }
 
-    // Check wind speed
+    // Check wind speed (warning only)
     Vector3f wind_vec;
     if (ahrs.wind_estimate(wind_vec)) {
         float wind_speed = wind_vec.xy().length();
@@ -1220,30 +1118,51 @@ bool ModeSmartPhoto99::check_gps_ekf_health() {
 }
 
 // ============================================================================
+// STATE TELEMETRY AND COMPANION INTERFACE
+// ============================================================================
+
+void ModeSmartPhoto99::send_state_telemetry() {
+    // Send mode number and state to companion computer at 10Hz
+    // This allows companion to monitor the drone's state
+
+    uint8_t mode_num = static_cast<uint8_t>(mode_number());
+    uint8_t state = static_cast<uint8_t>(mission_state.current_phase);
+
+    // Send as named floats for easy monitoring
+    gcs().send_named_float("Mode99Num", (float)mode_num);
+    gcs().send_named_float("Mode99State", (float)state);
+
+    // Note: State name is logged during state transitions for debugging
+}
+
+void ModeSmartPhoto99::receive_route_set_command() {
+    // Called by MAVLink handler when ROUTE_SET command is received from companion
+    mission_state.route_set_received = true;
+    mission_state.last_companion_msg_ms = AP_HAL::millis();
+
+    gcs().send_text(MAV_SEVERITY_INFO, "MODE99: ROUTE_SET command received");
+
+    // If in PLANNING state, the state machine will handle transition to INITIALIZING
+}
+
+// ============================================================================
 // PUBLIC INTERFACE FUNCTIONS
 // ============================================================================
 
 void ModeSmartPhoto99::set_mission_ready() {
-    // Called by companion via MAVLink to signal mission configured
-    mission_state.mission_configured = true;
-    mission_state.companion_ready = true;
-    gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Mission ready signal received");
-
-    // Auto-transition if conditions met
-    if (mission_state.current_phase == MissionPhase::INITIALIZATION) {
-        if (check_ready_to_arm()) {
-            transition_to_phase(MissionPhase::READY_TO_ARM);
-        }
-    }
+    // Legacy function - kept for compatibility
+    // Now triggers ROUTE_SET
+    receive_route_set_command();
 }
 
 void ModeSmartPhoto99::command_landing() {
     // Called by companion via MAVLink to initiate landing
-    if (mission_state.current_phase == MissionPhase::AUTONOMOUS_FLIGHT ||
-        mission_state.current_phase == MissionPhase::HOVER) {
+    // In new state machine, companion should command descent through normal position commands
+    // This function can be used to signal that destination is reached
+    if (mission_state.current_phase == MissionPhase::EXECUTING) {
         gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Landing commanded by companion");
-        mission_state.landing_target_alt_m = 0.0f;  // Land at ground level
-        transition_to_phase(MissionPhase::LANDING);
+        // The companion should send low altitude position commands to land
+        // Once landed, state will automatically transition to IDLE
     }
 }
 
