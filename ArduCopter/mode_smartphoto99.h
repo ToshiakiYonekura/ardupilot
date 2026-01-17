@@ -44,8 +44,8 @@ public:
     uint8_t get_mission_phase() const;
 
 protected:
-    const char *name() const override { return "SMARTPHOTO"; }
-    const char *name4() const override { return "SPHT"; }
+    const char *name() const override { return "SMARTPH99"; }
+    const char *name4() const override { return "SP99"; }
 
 private:
     // Mission state machine - New simplified 6-state design
@@ -137,13 +137,22 @@ private:
     };
 
     struct ControlGains {
-        // State feedback gains (LQR-like)
+        // State feedback gains (LQR-like) - legacy structure
         float K_pos[3];      // Position gains
         float K_vel[3];      // Velocity gains
         float K_att[3];      // Attitude gains
         float K_rate[3];     // Rate gains
         bool gains_valid;
     } control_gains;
+
+    // LQR gain matrix for momentum-based state feedback
+    // State vector: [pos_n, pos_e, pos_d, vel_n, vel_e, vel_d, roll, pitch, yaw, p, q, r]
+    // Control vector: [F_thrust, M_roll, M_pitch, M_yaw]
+    struct LQRGains {
+        float K[4][12];     // Gain matrix (4x12): u = -K * (x - x_ref)
+        bool valid;         // Whether LQR gains have been computed
+        bool use_lqr;       // Flag to enable LQR control (vs legacy control)
+    } lqr_gains;
 
     StateVector reference_state;
     StateVector current_state;
@@ -205,6 +214,12 @@ private:
     void compute_state_feedback_control();
     void use_attitude_controller_fallback();
     void apply_motor_commands(const Vector3f& moment_cmd, float thrust_cmd);
+
+    // LQR momentum-based control functions
+    void calculate_lqr_gains();
+    void compute_lqr_state_feedback_control();
+    void get_state_vector_12(float state[12]) const;
+    void get_reference_vector_12(float ref_state[12]) const;
 
     // Smooth attitude generation
     void calculate_desired_attitude_from_velocity(const Vector3f& vel_cmd,

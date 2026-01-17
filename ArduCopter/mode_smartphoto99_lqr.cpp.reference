@@ -1,0 +1,309 @@
+// ArduCopter/mode_smartphoto99_lqr.cpp
+// LQR State Feedback Controller based on Momentum Equations
+//
+// This file contains the momentum-based state feedback implementation
+// for Mode 99 using Linear Quadratic Regulator (LQR) design.
+//
+// State-Space Model (Linearized around hover):
+// ============================================================================
+// State vector (12 states):
+//   x = [pos_n, pos_e, pos_d, vel_n, vel_e, vel_d, roll, pitch, yaw, p, q, r]^T
+//
+// Control vector (4 inputs):
+//   u = [F_thrust, M_roll, M_pitch, M_yaw]^T
+//
+// Linearized dynamics: ẋ = A·x + B·u
+//
+// Translational Dynamics (Small angle approximation):
+//   v̇_n = g·θ - (F_thrust/m)·θ      (pitch causes north acceleration)
+//   v̇_e = -g·φ + (F_thrust/m)·φ     (roll causes east acceleration)
+//   v̇_d = (F_thrust - m·g)/m        (thrust causes vertical acceleration)
+//
+// Rotational Dynamics (Small rate approximation):
+//   ω̇ = I⁻¹·M                        (moments cause angular acceleration)
+//
+// LQR Design:
+//   Cost function: J = ∫(x^T·Q·x + u^T·R·u)dt
+//   Optimal gain: K = R⁻¹·B^T·P  where P solves the Riccati equation
+//   Control law: u = -K·(x - x_ref)
+// ============================================================================
+
+#include "Copter.h"
+#include "mode.h"
+
+#if MODE_SMARTPHOTO_ENABLED
+
+// State-space matrices for linearized quadcopter dynamics
+// These are computed based on the identified system parameters
+
+namespace ModeSmartPhoto99_LQR {
+
+// LQR gain matrix K (4x12)
+// u = -K * (x - x_ref)
+// Rows: [F_thrust, M_roll, M_pitch, M_yaw]
+// Cols: [pos_n, pos_e, pos_d, vel_n, vel_e, vel_d, roll, pitch, yaw, p, q, r]
+struct LQRGains {
+    float K[4][12];  // Gain matrix
+    bool valid;      // Whether gains have been computed
+};
+
+// Calculate LQR gains from system identification parameters
+void calculate_lqr_gains(LQRGains& lqr_gains,
+                        float mass,
+                        float Ixx, float Iyy, float Izz,
+                        float hover_thrust_N,
+                        float gravity = 9.80665f) {
+
+    // ========================================================================
+    // STEP 1: Build linearized A matrix (12x12)
+    // ẋ = A·x + B·u
+    // ========================================================================
+
+    // A matrix structure (linearized around hover):
+    // Position rates = velocities
+    // A(0,3) = 1.0  // ṗ_n = v_n
+    // A(1,4) = 1.0  // ṗ_e = v_e
+    // A(2,5) = 1.0  // ṗ_d = v_d
+
+    // Velocity dynamics (small angle approximation)
+    // v̇_n ≈ g·θ
+    // v̇_e ≈ -g·φ
+    // v̇_d = (F - mg)/m ≈ 0 at hover
+    // A(3,7) = gravity;   // v̇_n from pitch
+    // A(4,6) = -gravity;  // v̇_e from roll
+
+    // Attitude rates = angular velocities (small angle)
+    // A(6,9)  = 1.0;  // φ̇ = p
+    // A(7,10) = 1.0;  // θ̇ = q
+    // A(8,11) = 1.0;  // ψ̇ = r
+
+    // Angular acceleration (ω̇ = I⁻¹·M, but with no moments at hover, these are zero)
+    // The B matrix captures the control effect
+
+    // ========================================================================
+    // STEP 2: Build control matrix B (12x4)
+    // ========================================================================
+
+    // B matrix structure:
+    // Control inputs: u = [F_thrust, M_roll, M_pitch, M_yaw]^T
+
+    // Vertical acceleration from thrust
+    // B(5,0) = 1.0f / mass;  // v̇_d = F_thrust/m
+
+    // Angular acceleration from moments
+    // B(9,1)  = 1.0f / Ixx;  // ṗ = M_roll/Ixx
+    // B(10,2) = 1.0f / Iyy;  // q̇ = M_pitch/Iyy
+    // B(11,3) = 1.0f / Izz;  // ṙ = M_yaw/Izz
+
+    // ========================================================================
+    // STEP 3: Define LQR weighting matrices Q and R
+    // ========================================================================
+
+    // Q matrix (12x12) - State cost (diagonal for simplicity)
+    // Penalize deviations in: position, velocity, attitude, rates
+    float Q_diag[12] = {
+        // Position errors (meters) - moderate penalty
+        1.0f,   // pos_n
+        1.0f,   // pos_e
+        2.0f,   // pos_d (altitude more important)
+
+        // Velocity errors (m/s) - higher penalty for tight tracking
+        2.0f,   // vel_n
+        2.0f,   // vel_e
+        3.0f,   // vel_d
+
+        // Attitude errors (radians) - high penalty to stay level
+        10.0f,  // roll
+        10.0f,  // pitch
+        5.0f,   // yaw (less critical)
+
+        // Rate errors (rad/s) - moderate penalty for damping
+        1.0f,   // p
+        1.0f,   // q
+        0.5f    // r
+    };
+
+    // R matrix (4x4) - Control cost (diagonal)
+    // Penalize control effort
+    float R_diag[4] = {
+        0.1f,   // F_thrust (normalized, cheaper)
+        1.0f,   // M_roll
+        1.0f,   // M_pitch
+        2.0f    // M_yaw (more expensive)
+    };
+
+    // ========================================================================
+    // STEP 4: Solve Algebraic Riccati Equation (ARE)
+    // A^T·P + P·A - P·B·R⁻¹·B^T·P + Q = 0
+    // ========================================================================
+
+    // NOTE: Full ARE solution requires iterative numerical methods
+    // For embedded systems, we use a simplified approach:
+    // 1. Compute gains analytically for decoupled subsystems
+    // 2. Use empirical tuning based on Q, R weights
+
+    // For now, compute simplified gains using pole placement approximation
+    // This gives us a starting point that can be refined
+
+    // ========================================================================
+    // STEP 5: Compute LQR gain matrix K = R⁻¹·B^T·P
+    // Simplified approach: use Q, R weights directly
+    // ========================================================================
+
+    // Initialize all gains to zero
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 12; j++) {
+            lqr_gains.K[i][j] = 0.0f;
+        }
+    }
+
+    // Thrust channel gains (vertical control)
+    // u_thrust = -K_thrust * (x - x_ref)
+    lqr_gains.K[0][2] = sqrtf(Q_diag[2] / R_diag[0]) * mass * gravity * 0.5f;  // pos_d -> thrust
+    lqr_gains.K[0][5] = sqrtf(Q_diag[5] / R_diag[0]) * mass * 2.0f;            // vel_d -> thrust
+
+    // Roll moment gains (lateral control)
+    // u_M_roll = -K_roll * (x - x_ref)
+    lqr_gains.K[1][1] = sqrtf(Q_diag[1] / R_diag[1]) * gravity * 0.3f;         // pos_e -> roll moment
+    lqr_gains.K[1][4] = sqrtf(Q_diag[4] / R_diag[1]) * gravity * 0.5f;         // vel_e -> roll moment
+    lqr_gains.K[1][6] = sqrtf(Q_diag[6] / R_diag[1]) * Ixx * 15.0f;            // roll -> roll moment
+    lqr_gains.K[1][9] = sqrtf(Q_diag[9] / R_diag[1]) * Ixx * 3.0f;             // p -> roll moment
+
+    // Pitch moment gains (longitudinal control)
+    // u_M_pitch = -K_pitch * (x - x_ref)
+    lqr_gains.K[2][0] = sqrtf(Q_diag[0] / R_diag[2]) * gravity * 0.3f;         // pos_n -> pitch moment
+    lqr_gains.K[2][3] = sqrtf(Q_diag[3] / R_diag[2]) * gravity * 0.5f;         // vel_n -> pitch moment
+    lqr_gains.K[2][7] = sqrtf(Q_diag[7] / R_diag[2]) * Iyy * 15.0f;            // pitch -> pitch moment
+    lqr_gains.K[2][10] = sqrtf(Q_diag[10] / R_diag[2]) * Iyy * 3.0f;           // q -> pitch moment
+
+    // Yaw moment gains (heading control)
+    // u_M_yaw = -K_yaw * (x - x_ref)
+    lqr_gains.K[3][8] = sqrtf(Q_diag[8] / R_diag[3]) * Izz * 8.0f;             // yaw -> yaw moment
+    lqr_gains.K[3][11] = sqrtf(Q_diag[11] / R_diag[3]) * Izz * 2.0f;           // r -> yaw moment
+
+    lqr_gains.valid = true;
+}
+
+// Apply LQR control law to compute control inputs
+// u = u_hover - K * (x - x_ref)
+void compute_lqr_control(const LQRGains& lqr_gains,
+                        const float current_state[12],
+                        const float reference_state[12],
+                        float hover_thrust_N,
+                        float control_output[4]) {
+
+    if (!lqr_gains.valid) {
+        // Fallback: hover thrust and zero moments
+        control_output[0] = hover_thrust_N;
+        control_output[1] = 0.0f;
+        control_output[2] = 0.0f;
+        control_output[3] = 0.0f;
+        return;
+    }
+
+    // Compute state error: e = x - x_ref
+    float state_error[12];
+    for (int i = 0; i < 12; i++) {
+        state_error[i] = current_state[i] - reference_state[i];
+    }
+
+    // Wrap yaw error to [-π, π]
+    state_error[8] = wrap_PI(state_error[8]);
+
+    // Apply LQR control law: u = u_hover - K * e
+    // Note: We subtract because we want u to counteract the error
+
+    // Thrust control (output is in Newtons)
+    control_output[0] = hover_thrust_N;
+    for (int j = 0; j < 12; j++) {
+        control_output[0] -= lqr_gains.K[0][j] * state_error[j];
+    }
+
+    // Moment controls (output is in N·m)
+    for (int i = 1; i < 4; i++) {
+        control_output[i] = 0.0f;
+        for (int j = 0; j < 12; j++) {
+            control_output[i] -= lqr_gains.K[i][j] * state_error[j];
+        }
+    }
+
+    // Apply safety limits on control outputs
+    // Thrust limits
+    float min_thrust = hover_thrust_N * 0.3f;  // Minimum 30% hover thrust
+    float max_thrust = hover_thrust_N * 1.7f;  // Maximum 170% hover thrust
+    control_output[0] = constrain_float(control_output[0], min_thrust, max_thrust);
+
+    // Moment limits (will be converted to attitude commands)
+    // These are reasonable limits for typical copters
+    float max_roll_moment = 50.0f;   // N·m
+    float max_pitch_moment = 50.0f;  // N·m
+    float max_yaw_moment = 20.0f;    // N·m
+
+    control_output[1] = constrain_float(control_output[1], -max_roll_moment, max_roll_moment);
+    control_output[2] = constrain_float(control_output[2], -max_pitch_moment, max_pitch_moment);
+    control_output[3] = constrain_float(control_output[3], -max_yaw_moment, max_yaw_moment);
+}
+
+// Convert thrust and moments to attitude and throttle commands
+// for ArduPilot's attitude controller
+void convert_to_attitude_commands(float F_thrust,
+                                  float M_roll, float M_pitch, float M_yaw,
+                                  float mass, float Ixx, float Iyy, float Izz,
+                                  float hover_thrust_N,
+                                  float& roll_cmd, float& pitch_cmd,
+                                  float& yaw_rate_cmd, float& throttle_cmd) {
+
+    const float gravity = 9.80665f;  // m/s²
+
+    // ========================================================================
+    // THRUST to THROTTLE conversion
+    // ========================================================================
+    // Throttle is normalized [0, 1]
+    // At hover: throttle ≈ hover_throttle, F_thrust = m·g
+    float hover_throttle = hover_thrust_N / (mass * gravity);
+
+    // Linear approximation around hover
+    throttle_cmd = (F_thrust / (mass * gravity));
+    throttle_cmd = constrain_float(throttle_cmd, 0.1f, 0.9f);
+
+    // ========================================================================
+    // MOMENTS to ATTITUDE conversion
+    // ========================================================================
+    // For small angles, the relationship between moments and angular acceleration:
+    // M = I·α  =>  α = M/I
+    //
+    // We want to compute desired attitude that, through the inner attitude controller,
+    // will produce these moments.
+    //
+    // Approach: Use angular acceleration to estimate desired attitude rates,
+    // then integrate to get attitude commands
+    //
+    // For simplicity, we can approximate:
+    // desired_roll ≈ M_roll / (k_roll * Ixx)
+    // desired_pitch ≈ M_pitch / (k_pitch * Iyy)
+    // desired_yaw_rate ≈ M_yaw / (k_yaw * Izz)
+    //
+    // where k_* are empirical scaling factors based on the attitude controller gains
+
+    // Use moment-to-angle conversion based on system dynamics
+    // These gains convert moments to desired attitude angles
+    float k_roll_att = 100.0f;   // Empirical: N·m to radians
+    float k_pitch_att = 100.0f;  // Empirical: N·m to radians
+    float k_yaw_rate = 20.0f;    // Empirical: N·m to rad/s
+
+    roll_cmd = M_roll / k_roll_att;
+    pitch_cmd = M_pitch / k_pitch_att;
+    yaw_rate_cmd = M_yaw / k_yaw_rate;
+
+    // Apply attitude limits
+    const float max_tilt_angle = radians(30.0f);  // 30 degrees max
+    roll_cmd = constrain_float(roll_cmd, -max_tilt_angle, max_tilt_angle);
+    pitch_cmd = constrain_float(pitch_cmd, -max_tilt_angle, max_tilt_angle);
+
+    const float max_yaw_rate = radians(90.0f);  // 90 deg/s max
+    yaw_rate_cmd = constrain_float(yaw_rate_cmd, -max_yaw_rate, max_yaw_rate);
+}
+
+} // namespace ModeSmartPhoto99_LQR
+
+#endif  // MODE_SMARTPHOTO_ENABLED

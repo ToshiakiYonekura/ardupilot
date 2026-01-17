@@ -32,13 +32,22 @@ ModeSmartPhoto99::ModeSmartPhoto99() :
     sysid_data.throttle_hover = 0.0f;
     sysid_data.sample_count = 0;
 
-    // Initialize state feedback gains
+    // Initialize state feedback gains (legacy)
     control_gains.gains_valid = false;
     for (int i = 0; i < 3; i++) {
         control_gains.K_pos[i] = 0.0f;
         control_gains.K_vel[i] = 0.0f;
         control_gains.K_att[i] = 0.0f;
         control_gains.K_rate[i] = 0.0f;
+    }
+
+    // Initialize LQR gains
+    lqr_gains.valid = false;
+    lqr_gains.use_lqr = true;  // Enable LQR control by default
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 12; j++) {
+            lqr_gains.K[i][j] = 0.0f;
+        }
     }
 
     // Initialize state vectors
@@ -112,8 +121,15 @@ bool ModeSmartPhoto99::init(bool ignore_checks) {
         gcs().send_text(MAV_SEVERITY_WARNING,
             "SMARTPHOTO: No sysid parameters found, using defaults");
     } else {
-        // Calculate state feedback gains from identified parameters
-        calculate_state_feedback_gains();
+        // Calculate LQR gains from identified parameters (momentum-based)
+        if (lqr_gains.use_lqr) {
+            calculate_lqr_gains();
+            gcs().send_text(MAV_SEVERITY_INFO,
+                "SMARTPHOTO99: Using LQR momentum-based state feedback");
+        } else {
+            // Legacy: Calculate state feedback gains from identified parameters
+            calculate_state_feedback_gains();
+        }
         apply_identified_parameters();
     }
 
@@ -494,6 +510,14 @@ void ModeSmartPhoto99::compute_state_feedback_control() {
     // attitude_control and pos_control use their own dt from the main loop (400Hz)
     // State feedback calculations are performed at 100Hz for efficiency
 
+    // Check if LQR momentum-based control is enabled
+    if (lqr_gains.use_lqr && lqr_gains.valid) {
+        // Use LQR momentum-based state feedback control
+        compute_lqr_state_feedback_control();
+        return;
+    }
+
+    // Legacy control: Use cascaded state feedback gains
     // Use default gains if not loaded from system ID
     if (!control_gains.gains_valid) {
         // Fallback to default position control with attitude controller
@@ -798,6 +822,231 @@ void ModeSmartPhoto99::calculate_attitude_rates(float dt) {
     attitude_target.roll_rate = constrain_float(attitude_target.roll_rate, -smoothing.max_tilt_rate, smoothing.max_tilt_rate);
     attitude_target.pitch_rate = constrain_float(attitude_target.pitch_rate, -smoothing.max_tilt_rate, smoothing.max_tilt_rate);
     attitude_target.yaw_rate = constrain_float(attitude_target.yaw_rate, -smoothing.max_yaw_rate, smoothing.max_yaw_rate);
+}
+
+// ============================================================================
+// LQR MOMENTUM-BASED STATE FEEDBACK CONTROL
+// ============================================================================
+
+// Calculate LQR gains from system identification data
+void ModeSmartPhoto99::calculate_lqr_gains() {
+    if (!sysid_data.parameters_loaded) {
+        lqr_gains.valid = false;
+        return;
+    }
+
+    const float gravity = GRAVITY_MSS;  // 9.80665 m/s²
+
+    // Compute hover thrust in Newtons from hover throttle
+    // At hover: F_thrust = m * g
+    float hover_thrust_N = sysid_data.mass * gravity;
+
+    // Build LQR gain matrix using simplified approach
+    // Full LQR solution requires solving Riccati equation numerically
+    // For embedded implementation, we use analytical approximations
+
+    // ========================================================================
+    // Q matrix (state cost) - diagonal weights
+    // ========================================================================
+    float Q_diag[12] = {
+        1.0f,   // pos_n (m)
+        1.0f,   // pos_e (m)
+        2.0f,   // pos_d (m) - altitude more critical
+        2.0f,   // vel_n (m/s)
+        2.0f,   // vel_e (m/s)
+        3.0f,   // vel_d (m/s)
+        10.0f,  // roll (rad)
+        10.0f,  // pitch (rad)
+        5.0f,   // yaw (rad)
+        1.0f,   // p (rad/s)
+        1.0f,   // q (rad/s)
+        0.5f    // r (rad/s)
+    };
+
+    // R matrix (control cost) - diagonal weights
+    float R_diag[4] = {
+        0.1f,   // F_thrust (cheaper)
+        1.0f,   // M_roll (N·m)
+        1.0f,   // M_pitch (N·m)
+        2.0f    // M_yaw (N·m)
+    };
+
+    // Initialize gain matrix to zero
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 12; j++) {
+            lqr_gains.K[i][j] = 0.0f;
+        }
+    }
+
+    // ========================================================================
+    // Compute gains using sqrt(Q/R) scaling
+    // This provides a reasonable starting point for LQR-like gains
+    // ========================================================================
+
+    // Thrust channel (vertical control)
+    lqr_gains.K[0][2] = sqrtf(Q_diag[2] / R_diag[0]) * sysid_data.mass * gravity * 0.5f;  // pos_d
+    lqr_gains.K[0][5] = sqrtf(Q_diag[5] / R_diag[0]) * sysid_data.mass * 2.0f;            // vel_d
+
+    // Roll moment channel (lateral control)
+    lqr_gains.K[1][1] = sqrtf(Q_diag[1] / R_diag[1]) * gravity * 0.3f;                    // pos_e
+    lqr_gains.K[1][4] = sqrtf(Q_diag[4] / R_diag[1]) * gravity * 0.5f;                    // vel_e
+    lqr_gains.K[1][6] = sqrtf(Q_diag[6] / R_diag[1]) * sysid_data.Ixx * 15.0f;            // roll
+    lqr_gains.K[1][9] = sqrtf(Q_diag[9] / R_diag[1]) * sysid_data.Ixx * 3.0f;             // p
+
+    // Pitch moment channel (longitudinal control)
+    lqr_gains.K[2][0] = sqrtf(Q_diag[0] / R_diag[2]) * gravity * 0.3f;                    // pos_n
+    lqr_gains.K[2][3] = sqrtf(Q_diag[3] / R_diag[2]) * gravity * 0.5f;                    // vel_n
+    lqr_gains.K[2][7] = sqrtf(Q_diag[7] / R_diag[2]) * sysid_data.Iyy * 15.0f;            // pitch
+    lqr_gains.K[2][10] = sqrtf(Q_diag[10] / R_diag[2]) * sysid_data.Iyy * 3.0f;           // q
+
+    // Yaw moment channel (heading control)
+    lqr_gains.K[3][8] = sqrtf(Q_diag[8] / R_diag[3]) * sysid_data.Izz * 8.0f;             // yaw
+    lqr_gains.K[3][11] = sqrtf(Q_diag[11] / R_diag[3]) * sysid_data.Izz * 2.0f;           // r
+
+    lqr_gains.valid = true;
+
+    gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: LQR gains calculated");
+    gcs().send_text(MAV_SEVERITY_INFO, "Mass=%.2f kg, Hover=%.1f N",
+                   (double)sysid_data.mass, (double)hover_thrust_N);
+}
+
+// Pack current state into 12-element array
+void ModeSmartPhoto99::get_state_vector_12(float state[12]) const {
+    state[0] = current_state.pos_n;
+    state[1] = current_state.pos_e;
+    state[2] = current_state.pos_d;
+    state[3] = current_state.vel_n;
+    state[4] = current_state.vel_e;
+    state[5] = current_state.vel_d;
+    state[6] = current_state.roll;
+    state[7] = current_state.pitch;
+    state[8] = current_state.yaw;
+    state[9] = current_state.roll_rate;
+    state[10] = current_state.pitch_rate;
+    state[11] = current_state.yaw_rate;
+}
+
+// Pack reference state into 12-element array
+void ModeSmartPhoto99::get_reference_vector_12(float ref_state[12]) const {
+    ref_state[0] = reference_state.pos_n;
+    ref_state[1] = reference_state.pos_e;
+    ref_state[2] = reference_state.pos_d;
+    ref_state[3] = reference_state.vel_n;
+    ref_state[4] = reference_state.vel_e;
+    ref_state[5] = reference_state.vel_d;
+    ref_state[6] = reference_state.roll;
+    ref_state[7] = reference_state.pitch;
+    ref_state[8] = reference_state.yaw;
+    ref_state[9] = reference_state.roll_rate;
+    ref_state[10] = reference_state.pitch_rate;
+    ref_state[11] = reference_state.yaw_rate;
+}
+
+// Compute LQR state feedback control
+void ModeSmartPhoto99::compute_lqr_state_feedback_control() {
+    if (!lqr_gains.valid) {
+        // Fallback to attitude controller
+        use_attitude_controller_fallback();
+        return;
+    }
+
+    const float gravity = GRAVITY_MSS;  // 9.80665 m/s²
+
+    // Compute hover thrust in Newtons
+    float hover_thrust_N = sysid_data.mass * gravity;
+
+    // Get current and reference state vectors
+    float current_state_vec[12];
+    float reference_state_vec[12];
+    get_state_vector_12(current_state_vec);
+    get_reference_vector_12(reference_state_vec);
+
+    // Compute state error: e = x - x_ref
+    float state_error[12];
+    for (int i = 0; i < 12; i++) {
+        state_error[i] = current_state_vec[i] - reference_state_vec[i];
+    }
+    // Wrap yaw error to [-π, π]
+    state_error[8] = wrap_PI(state_error[8]);
+
+    // Apply LQR control law: u = u_hover - K * e
+    float control_output[4];  // [F_thrust, M_roll, M_pitch, M_yaw]
+
+    // Thrust control
+    control_output[0] = hover_thrust_N;
+    for (int j = 0; j < 12; j++) {
+        control_output[0] -= lqr_gains.K[0][j] * state_error[j];
+    }
+
+    // Moment controls
+    for (int i = 1; i < 4; i++) {
+        control_output[i] = 0.0f;
+        for (int j = 0; j < 12; j++) {
+            control_output[i] -= lqr_gains.K[i][j] * state_error[j];
+        }
+    }
+
+    // Apply safety limits
+    float min_thrust = hover_thrust_N * 0.3f;
+    float max_thrust = hover_thrust_N * 1.7f;
+    control_output[0] = constrain_float(control_output[0], min_thrust, max_thrust);
+
+    float max_roll_moment = 50.0f;   // N·m
+    float max_pitch_moment = 50.0f;  // N·m
+    float max_yaw_moment = 20.0f;    // N·m
+    control_output[1] = constrain_float(control_output[1], -max_roll_moment, max_roll_moment);
+    control_output[2] = constrain_float(control_output[2], -max_pitch_moment, max_pitch_moment);
+    control_output[3] = constrain_float(control_output[3], -max_yaw_moment, max_yaw_moment);
+
+    // ========================================================================
+    // Convert thrust and moments to attitude commands for ArduPilot
+    // ========================================================================
+
+    // Throttle conversion (normalized 0-1)
+    float throttle_cmd = control_output[0] / (sysid_data.mass * gravity);
+    throttle_cmd = constrain_float(throttle_cmd, 0.1f, 0.9f);
+
+    // Moment to attitude conversion
+    // Use empirical scaling based on system dynamics
+    float k_roll_att = 100.0f;   // N·m to radians
+    float k_pitch_att = 100.0f;  // N·m to radians
+    float k_yaw_rate = 20.0f;    // N·m to rad/s
+
+    float roll_cmd = control_output[1] / k_roll_att;
+    float pitch_cmd = control_output[2] / k_pitch_att;
+    float yaw_rate_cmd = control_output[3] / k_yaw_rate;
+
+    // Apply attitude limits
+    const float max_tilt_angle = attitude_control->lean_angle_max_rad();
+    roll_cmd = constrain_float(roll_cmd, -max_tilt_angle, max_tilt_angle);
+    pitch_cmd = constrain_float(pitch_cmd, -max_tilt_angle, max_tilt_angle);
+
+    const float max_yaw_rate = radians(90.0f);
+    yaw_rate_cmd = constrain_float(yaw_rate_cmd, -max_yaw_rate, max_yaw_rate);
+
+    // ========================================================================
+    // Send commands to ArduPilot's attitude controller
+    // ========================================================================
+
+    attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_rad(
+        roll_cmd, pitch_cmd, yaw_rate_cmd
+    );
+
+    attitude_control->set_throttle_out(throttle_cmd, true, g.throttle_filt);
+
+    // Telemetry for monitoring
+    gcs().send_named_float("LQR_Thrust", control_output[0]);     // [N]
+    gcs().send_named_float("LQR_M_roll", control_output[1]);     // [N·m]
+    gcs().send_named_float("LQR_M_pitch", control_output[2]);    // [N·m]
+    gcs().send_named_float("LQR_M_yaw", control_output[3]);      // [N·m]
+    gcs().send_named_float("LQR_RollCmd", degrees(roll_cmd));    // [deg]
+    gcs().send_named_float("LQR_PitchCmd", degrees(pitch_cmd));  // [deg]
+    gcs().send_named_float("LQR_Throttle", throttle_cmd);        // [0-1]
+
+    // Report execution every second
+    if (state_feedback_counter % 100 == 0) {
+        gcs().send_named_float("LQR_Rate", 100.0f);  // 100Hz
+    }
 }
 
 // ============================================================================

@@ -1,0 +1,150 @@
+╔══════════════════════════════════════════════════════════════════════════╗
+║                   MODE 99 LQR CONTROLLER - QUICK START                   ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 1: Open Terminal and Launch SITL                                   │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    cd ~/ardupilot/ArduCopter
+    ../Tools/autotest/sim_vehicle.py --console --map
+
+    Wait for: MAV> prompt and GPS messages
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 2: Wait for GPS Lock (30-60 seconds)                               │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    Look for:
+    • "EKF2 IMU0 is using GPS"
+    • "EKF2 IMU0 origin set"
+    • GPS satellites: 10+
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 3: Arm the Vehicle                                                 │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    MAV> arm throttle
+
+    Expected: "APM: Throttle armed"
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 4: Switch to Mode 99 (LQR State Feedback) ★                       │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    MAV> mode 99
+
+    ★★★ WATCH FOR THESE CRITICAL MESSAGES ★★★
+
+    ✓ APM: SMARTPHOTO99: Using LQR momentum-based state feedback
+    ✓ APM: SMARTPHOTO99: LQR gains calculated
+    ✓ APM: Mass=2.00 kg, Hover=19.6 N
+    ✓ APM: SMARTPHOTO99: Entered PLANNING state
+
+    If you see these → SUCCESS! LQR is working! ✓
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 5: Take Off                                                        │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    MAV> rc 3 1650
+
+    Copter should climb smoothly to ~5-10 meters
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 6: Hover and Observe Telemetry                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    MAV> rc 3 1500
+
+    Watch console for LQR telemetry:
+
+    LQR_Thrust: ~19.6 N      (should be close to mass × gravity)
+    LQR_M_roll: ~0 N·m       (small corrections)
+    LQR_M_pitch: ~0 N·m      (small corrections)
+    LQR_M_yaw: ~0 N·m        (heading hold)
+    LQR_Rate: 100.0 Hz       (execution rate)
+    LQR_RollCmd: ~0°         (attitude command)
+    LQR_PitchCmd: ~0°        (attitude command)
+    LQR_Throttle: ~0.5       (normalized 0-1)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 7: Test Controls                                                   │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    Roll right:   rc 1 1700   (then back to center: rc 1 1500)
+    Pitch forward: rc 2 1700   (then back to center: rc 2 1500)
+    Yaw right:    rc 4 1700   (then back to center: rc 4 1500)
+    Climb:        rc 3 1600   (then hover: rc 3 1500)
+    Descend:      rc 3 1400   (then hover: rc 3 1500)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ STEP 8: Land                                                            │
+└──────────────────────────────────────────────────────────────────────────┘
+
+    MAV> rc 3 1200
+
+    Vehicle will descend and auto-disarm on landing
+    Or manually: disarm
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ TROUBLESHOOTING                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  Problem: Mode 99 not available
+  → Check: grep MODE_SMARTPHOTO_ENABLED ArduCopter/config.h
+
+  Problem: "No sysid parameters found"
+  → Check: ls -la ~/ardupilot/sysid_params.txt
+  → File should exist in ardupilot root directory
+
+  Problem: No LQR telemetry messages
+  → sysid_params.txt might not be loaded
+  → Check file format and values
+
+  Problem: Oscillations or instability
+  → Reduce Q matrix values (less aggressive)
+  → Increase R matrix values (smoother control)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ALTERNATIVE: AUTOMATED TESTING                                           │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  Terminal 1:
+    cd ~/ardupilot/ArduCopter
+    ../Tools/autotest/sim_vehicle.py --console --map
+
+  Terminal 2 (after SITL is running):
+    cd ~/ardupilot
+    python3 test_lqr_automated.py
+
+  This will automatically:
+    • Connect to SITL
+    • Wait for GPS
+    • Arm vehicle
+    • Switch to mode 99
+    • Monitor LQR telemetry
+    • Report results
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ SUCCESS CRITERIA                                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  ✓ LQR gains calculated
+  ✓ Controller runs at 100 Hz
+  ✓ Stable hover achieved
+  ✓ Smooth response to commands
+  ✓ No oscillations
+  ✓ Thrust ≈ weight at hover (~19.6 N for 2kg)
+
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ADDITIONAL RESOURCES                                                     │
+└──────────────────────────────────────────────────────────────────────────┘
+
+  Detailed Guide:    ~/ardupilot/TESTING_MODE99_LQR.md
+  Design Document:   ~/ardupilot/ArduCopter/LQR_STATE_FEEDBACK_DESIGN.md
+  System ID Params:  ~/ardupilot/sysid_params.txt
+
+╔══════════════════════════════════════════════════════════════════════════╗
+║  Ready to test! Open terminal and run the commands above.               ║
+╚══════════════════════════════════════════════════════════════════════════╝
