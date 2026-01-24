@@ -38,67 +38,25 @@ public:
                                    float yaw_target, float yaw_rate_target);
     bool companion_command_valid() const;
 
-    // Mission sequence interface
-    void set_mission_ready();
-    void command_landing();
-    uint8_t get_mission_phase() const;
-
 protected:
     const char *name() const override { return "SMARTPH99"; }
     const char *name4() const override { return "SP99"; }
 
 private:
-    // Mission state machine - New simplified 6-state design
-    enum class MissionPhase : uint8_t {
-        OUT_OF_MODE99 = 0,      // Not in mode 99
-        PLANNING = 1,           // Waiting for ROUTE_SET from companion
-        INITIALIZING = 2,       // Arming and rising to 50m altitude
-        EXECUTING = 3,          // Executing autonomous mission
-        COMPLETED = 4,          // Mission completed (reserved for future use)
-        IDLE = 5                // Mission ended, disarming
-    };
-
-    struct MissionState {
-        MissionPhase current_phase;
-        MissionPhase previous_phase;
-        uint32_t phase_start_time_ms;
-
-        // Phase-specific flags
-        bool route_set_received;        // ROUTE_SET message received from companion
-        uint8_t companion_state;        // Last received companion state
-        uint32_t last_companion_msg_ms; // Last companion message timestamp
-
-        // Safety monitoring
+    // Safety monitoring flags
+    struct SafetyState {
         bool battery_low;
         bool battery_critical;
         bool gps_healthy;
         bool ekf_healthy;
+        uint32_t last_companion_msg_ms; // Last companion message timestamp for heartbeat monitoring
+    } safety_state;
 
-        // Timing
-        uint32_t landing_detect_start_ms;
-
-        // Takeoff/landing parameters
-        float takeoff_start_alt_m;
-        float takeoff_target_alt_m;
-    } mission_state;
-
-    // Mission configuration parameters
-    static constexpr float TAKEOFF_ALTITUDE_M = 50.0f;       // Target altitude above start
-    static constexpr float ALTITUDE_THRESHOLD_M = 49.0f;     // Altitude threshold for state transition
-    static constexpr float TAKEOFF_CLIMB_RATE_MS = 2.5f;     // Climb rate m/s
-    static constexpr float LANDING_DESCENT_RATE_MS = 1.0f;   // Descent rate m/s
-    static constexpr float LANDING_FINAL_RATE_MS = 0.5f;     // Final descent rate below 5m
-    static constexpr uint32_t LANDING_STABILITY_MS = 2000;   // 2 second stability check
-    static constexpr uint32_t COMPANION_TIMEOUT_MS = 500;    // 500ms command timeout
+    // Safety configuration parameters
+    static constexpr uint32_t COMPANION_TIMEOUT_MS = 1000;   // 1 second heartbeat timeout (per spec)
     static constexpr float BATTERY_LOW_PERCENT = 30.0f;      // Low battery warning
     static constexpr float BATTERY_CRITICAL_PERCENT = 20.0f; // Force landing
     static constexpr float MAX_WIND_SPEED_MS = 15.0f;        // Max safe wind speed
-
-    // Mission state machine timing
-    uint32_t last_state_machine_ms;
-    uint32_t last_state_telemetry_ms;
-    static constexpr uint32_t STATE_MACHINE_DT_MS = 100;     // 10Hz state machine update
-    static constexpr uint32_t STATE_TELEMETRY_DT_MS = 100;   // 10Hz state telemetry
 
     // System identification data loaded from file
     struct SysidData {
@@ -228,31 +186,9 @@ private:
                                  float dt);
     void calculate_attitude_rates(float dt);
 
-    // Mission state machine functions
-    void update_mission_state_machine();
-    void transition_to_phase(MissionPhase new_phase);
-    const char* get_phase_name(MissionPhase phase) const;
-    void send_state_telemetry();
-
-    // Phase handler functions
-    void handle_out_of_mode99_phase();
-    void handle_planning_phase();
-    void handle_initializing_phase();
-    void handle_executing_phase();
-    void handle_completed_phase();
-    void handle_idle_phase();
-
-    // Transition check functions
-    bool check_altitude_threshold_reached();
-    bool check_destination_reached();
-    bool check_landing_complete();
-
-    // Companion interface
-    void receive_route_set_command();
-
     // Safety monitoring functions
-    void update_safety_flags();
-    void check_emergency_conditions();
+    void check_failsafes();
     bool check_battery_level();
     bool check_gps_ekf_health();
+    bool check_companion_heartbeat();
 };
