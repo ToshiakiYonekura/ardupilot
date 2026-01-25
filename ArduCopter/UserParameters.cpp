@@ -11,6 +11,13 @@ const AP_Param::GroupInfo UserParameters::var_info[] = {
     AP_GROUPINFO("_INT16", 1, UserParameters, _int16, 0),
     AP_GROUPINFO("_FLOAT", 2, UserParameters, _float, 0),
 
+    // @Param: _MISSION_RDY
+    // @DisplayName: Mission Ready Flag for Mode 99
+    // @Description: Signals mission configuration completion to Raspberry Pi companion computer. Set to 1 when mission is configured in Mission Planner. Raspberry Pi monitors this parameter to trigger autonomous flight sequence.
+    // @Values: 0:Not Ready, 1:Mission Configured
+    // @User: Advanced
+    AP_GROUPINFO("_MISSION_RDY", 3, UserParameters, _mission_ready, 0),
+
     AP_GROUPEND
 };
 

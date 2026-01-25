@@ -12,6 +12,9 @@
 #if WEATHERVANE_ENABLED
  #include <AC_AttitudeControl/AC_WeatherVane.h>
 #endif
+#if USER_PARAMS_ENABLED
+ #include "UserParameters.h"
+#endif
 
 // Global parameter class.
 //
@@ -561,6 +564,11 @@ public:
     AP_SmartRTL smart_rtl;
 #endif
 
+#if USER_PARAMS_ENABLED
+    // User custom parameters
+    UserParameters user_parameters;
+#endif
+
     // wheel encoder and winch
 #if AP_WINCH_ENABLED
     AP_Winch winch;
@@ -584,11 +592,6 @@ public:
 #if MODE_FOLLOW_ENABLED
     // follow
     AP_Follow follow;
-#endif
-
-#if USER_PARAMS_ENABLED
-    // User custom parameters
-    UserParameters user_parameters;
 #endif
 
 #if AUTOTUNE_ENABLED
