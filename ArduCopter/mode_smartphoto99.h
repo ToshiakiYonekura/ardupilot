@@ -53,7 +53,7 @@ private:
     } safety_state;
 
     // Safety configuration parameters
-    static constexpr uint32_t COMPANION_TIMEOUT_MS = 1000;   // 1 second heartbeat timeout (per spec)
+    static constexpr uint32_t COMPANION_TIMEOUT_MS = 5000;   // 5 second heartbeat timeout (per spec: FS_GCS_TIMEOUT)
     static constexpr float BATTERY_LOW_PERCENT = 30.0f;      // Low battery warning
     static constexpr float BATTERY_CRITICAL_PERCENT = 20.0f; // Force landing
     static constexpr float MAX_WIND_SPEED_MS = 15.0f;        // Max safe wind speed

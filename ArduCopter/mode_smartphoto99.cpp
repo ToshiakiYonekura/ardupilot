@@ -272,13 +272,15 @@ void ModeSmartPhoto99::run() {
         }
 
         // Calculate desired attitude from velocity command
+        // Roll and pitch are calculated from position/velocity errors to achieve desired motion
         float roll_desired, pitch_desired;
         calculate_desired_attitude_from_velocity(target_velocity_ned, roll_desired, pitch_desired);
 
         // Smooth attitude targets to ensure smooth motion
         smooth_attitude_targets(roll_desired, pitch_desired, target_yaw_cmd, dt_100hz);
 
-        // Calculate attitude rates from smoothed attitude changes
+        // Calculate roll/pitch rates from smoothed attitude changes
+        // Note: Yaw rate is NOT calculated here - it's used directly from command
         calculate_attitude_rates(dt_100hz);
 
         // Set reference state using smoothed attitude targets
@@ -294,7 +296,8 @@ void ModeSmartPhoto99::run() {
         reference_state.yaw = attitude_target.yaw;
         reference_state.roll_rate = attitude_target.roll_rate;
         reference_state.pitch_rate = attitude_target.pitch_rate;
-        reference_state.yaw_rate = attitude_target.yaw_rate;
+        // Use yaw rate directly from command (not calculated from yaw changes)
+        reference_state.yaw_rate = target_yaw_rate_cmd;
 
         // Compute state feedback control @ 100Hz
         compute_state_feedback_control();
@@ -1040,7 +1043,7 @@ void ModeSmartPhoto99::check_failsafes() {
 
     // 1. Communication Loss Failsafe
     //    Monitor heartbeat from Raspberry Pi
-    //    Automatically transition to LAND mode if lost for 1 second or more
+    //    Automatically transition to LAND mode if lost for 5 seconds or more
     if (!check_companion_heartbeat() && motors->armed()) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: COMPANION HEARTBEAT LOST - SWITCHING TO LAND");
         copter.set_mode(Mode::Number::LAND, ModeReason::RADIO_FAILSAFE);
@@ -1147,7 +1150,7 @@ bool ModeSmartPhoto99::check_gps_ekf_health() {
 
 bool ModeSmartPhoto99::check_companion_heartbeat() {
     // Per specification: Monitor heartbeat from Raspberry Pi
-    // Detect when heartbeat is lost for 1 second or more
+    // Detect when heartbeat is lost for 5 seconds or more
 
     uint32_t now_ms = AP_HAL::millis();
 
@@ -1156,7 +1159,7 @@ bool ModeSmartPhoto99::check_companion_heartbeat() {
         return false;
     }
 
-    // Check if heartbeat timeout exceeded (1000ms per spec)
+    // Check if heartbeat timeout exceeded (5000ms per spec: FS_GCS_TIMEOUT)
     uint32_t time_since_last_msg = now_ms - safety_state.last_companion_msg_ms;
     if (time_since_last_msg > COMPANION_TIMEOUT_MS) {
         static uint32_t last_heartbeat_warning_ms = 0;
