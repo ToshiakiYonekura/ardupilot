@@ -1,0 +1,27 @@
+# System Identification Parameters for Medium Quadcopter
+# Generated for Mode 99 LQR State Feedback Controller
+# All values in SI units
+# Format: KEY=VALUE (no spaces around =)
+
+# Mass and Inertia
+MASS=2.0
+IXX=0.0347
+IYY=0.0458
+IZZ=0.0977
+
+# Motor Configuration
+MOTOR_KV=920.0
+MAX_THRUST=8.0
+ARM_LENGTH=0.225
+MOMENT_COEFF=0.016
+
+# Rate Controller Gains (from ArduPilot tuning)
+ROLL_GAIN=0.135
+PITCH_GAIN=0.135
+YAW_GAIN=0.18
+
+# Throttle
+THROTTLE_HOVER=0.5
+
+# Metadata
+SAMPLES=1000

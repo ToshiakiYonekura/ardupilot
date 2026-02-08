@@ -67,6 +67,8 @@ private:
         // Motor configuration
         float motor_kv;                // KV value
         float max_thrust_per_motor;    // Max thrust per motor
+        float arm_length;              // Distance from center to motor (m)
+        float moment_coefficient;      // Torque/thrust ratio (m)
 
         // Identified control parameters
         float roll_rate_gain;
@@ -178,6 +180,10 @@ private:
     void compute_lqr_state_feedback_control();
     void get_state_vector_12(float state[12]) const;
     void get_reference_vector_12(float ref_state[12]) const;
+
+    // Pure LQR: Motor mixing functions
+    void mix_motors_from_lqr(float F_total, float M_roll, float M_pitch, float M_yaw, float motor_thrust[4]);
+    void thrust_to_pwm(const float motor_thrust[4], uint16_t motor_pwm[4]);
 
     // Smooth attitude generation
     void calculate_desired_attitude_from_velocity(const Vector3f& vel_cmd,

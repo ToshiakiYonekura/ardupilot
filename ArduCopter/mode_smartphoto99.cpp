@@ -26,6 +26,8 @@ ModeSmartPhoto99::ModeSmartPhoto99() :
     sysid_data.Izz = 0.0f;
     sysid_data.motor_kv = 0.0f;
     sysid_data.max_thrust_per_motor = 0.0f;
+    sysid_data.arm_length = 0.225f;         // Default: 0.225m (medium quad)
+    sysid_data.moment_coefficient = 0.016f;  // Default: 0.016m (typical for props)
     sysid_data.roll_rate_gain = 0.0f;
     sysid_data.pitch_rate_gain = 0.0f;
     sysid_data.yaw_rate_gain = 0.0f;
@@ -365,6 +367,10 @@ bool ModeSmartPhoto99::load_identified_parameters() {
                 sysid_data.motor_kv = value;
             } else if (strcmp(key, "MAX_THRUST") == 0) {
                 sysid_data.max_thrust_per_motor = value;
+            } else if (strcmp(key, "ARM_LENGTH") == 0) {
+                sysid_data.arm_length = value;
+            } else if (strcmp(key, "MOMENT_COEFF") == 0) {
+                sysid_data.moment_coefficient = value;
             } else if (strcmp(key, "ROLL_GAIN") == 0) {
                 sysid_data.roll_rate_gain = value;
             } else if (strcmp(key, "PITCH_GAIN") == 0) {
@@ -814,6 +820,22 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
         return;
     }
 
+    // ========================================================================
+    // SAFETY: Validate system ID parameters before using in calculations
+    // ========================================================================
+    if (sysid_data.mass <= 0.0f || sysid_data.mass > 100.0f) {
+        gcs().send_text(MAV_SEVERITY_ERROR, "SMARTPHOTO99: Invalid mass %.2f kg", (double)sysid_data.mass);
+        lqr_gains.valid = false;
+        return;
+    }
+
+    if (sysid_data.Ixx <= 0.0f || sysid_data.Iyy <= 0.0f || sysid_data.Izz <= 0.0f) {
+        gcs().send_text(MAV_SEVERITY_ERROR, "SMARTPHOTO99: Invalid inertia Ixx=%.4f Iyy=%.4f Izz=%.4f",
+            (double)sysid_data.Ixx, (double)sysid_data.Iyy, (double)sysid_data.Izz);
+        lqr_gains.valid = false;
+        return;
+    }
+
     const float gravity = GRAVITY_MSS;  // 9.80665 m/s²
 
     // Compute hover thrust in Newtons from hover throttle
@@ -921,6 +943,77 @@ void ModeSmartPhoto99::get_reference_vector_12(float ref_state[12]) const {
     ref_state[11] = reference_state.yaw_rate;
 }
 
+// ============================================================================
+// PURE LQR: Motor Mixing (X-Configuration Quadcopter)
+// ============================================================================
+// Converts total thrust + moments to individual motor thrusts
+// Motor layout (X-config): FL(0) FR(1) X RL(2) RR(3)
+void ModeSmartPhoto99::mix_motors_from_lqr(float F_total, float M_roll, float M_pitch, float M_yaw,
+                                            float motor_thrust[4]) {
+    const float L = sysid_data.arm_length;        // Moment arm (m)
+    const float kM = sysid_data.moment_coefficient; // Torque/thrust ratio (m)
+
+    // Safety check
+    if (L <= 0.0f || kM <= 0.0f) {
+        // Use defaults if not loaded
+        gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Using default motor mixing params");
+        for (int i = 0; i < 4; i++) {
+            motor_thrust[i] = F_total / 4.0f;
+        }
+        return;
+    }
+
+    // X-configuration motor mixing
+    // Thrust distribution + moment allocation
+    float F_base = F_total / 4.0f;
+
+    // Motor 0 (Front-Left): +Roll axis, +Pitch axis
+    motor_thrust[0] = F_base - M_roll / (4.0f * L) - M_pitch / (4.0f * L) + M_yaw / (4.0f * kM);
+
+    // Motor 1 (Front-Right): -Roll axis, +Pitch axis
+    motor_thrust[1] = F_base + M_roll / (4.0f * L) - M_pitch / (4.0f * L) - M_yaw / (4.0f * kM);
+
+    // Motor 2 (Rear-Left): +Roll axis, -Pitch axis
+    motor_thrust[2] = F_base - M_roll / (4.0f * L) + M_pitch / (4.0f * L) - M_yaw / (4.0f * kM);
+
+    // Motor 3 (Rear-Right): -Roll axis, -Pitch axis
+    motor_thrust[3] = F_base + M_roll / (4.0f * L) + M_pitch / (4.0f * L) + M_yaw / (4.0f * kM);
+
+    // Clamp to valid range (0 to max thrust per motor)
+    float max_thrust = sysid_data.max_thrust_per_motor;
+    if (max_thrust <= 0.0f) {
+        max_thrust = 8.0f;  // Default max thrust
+    }
+
+    for (int i = 0; i < 4; i++) {
+        motor_thrust[i] = constrain_float(motor_thrust[i], 0.0f, max_thrust);
+    }
+}
+
+// Convert motor thrust (N) to PWM (1000-2000)
+void ModeSmartPhoto99::thrust_to_pwm(const float motor_thrust[4], uint16_t motor_pwm[4]) {
+    // Thrust to PWM mapping
+    // Assuming linear: thrust = k * (pwm - 1000)^2 approximately
+    // Simplified: thrust = max_thrust * ((pwm - 1000) / 1000)^2
+
+    float max_thrust = sysid_data.max_thrust_per_motor;
+    if (max_thrust <= 0.0f) {
+        max_thrust = 8.0f;  // Default
+    }
+
+    for (int i = 0; i < 4; i++) {
+        if (motor_thrust[i] <= 0.0f) {
+            motor_pwm[i] = 1000;
+        } else {
+            // Inverse: pwm = 1000 + 1000 * sqrt(thrust / max_thrust)
+            float thrust_ratio = motor_thrust[i] / max_thrust;
+            thrust_ratio = constrain_float(thrust_ratio, 0.0f, 1.0f);
+            float pwm_float = 1000.0f + 1000.0f * sqrtf(thrust_ratio);
+            motor_pwm[i] = (uint16_t)constrain_float(pwm_float, 1000.0f, 2000.0f);
+        }
+    }
+}
+
 // Compute LQR state feedback control
 void ModeSmartPhoto99::compute_lqr_state_feedback_control() {
     if (!lqr_gains.valid) {
@@ -978,49 +1071,52 @@ void ModeSmartPhoto99::compute_lqr_state_feedback_control() {
     control_output[3] = constrain_float(control_output[3], -max_yaw_moment, max_yaw_moment);
 
     // ========================================================================
-    // Convert thrust and moments to attitude commands for ArduPilot
+    // PURE LQR: Convert thrust and moments directly to motor commands
     // ========================================================================
 
-    // Throttle conversion (normalized 0-1)
-    float throttle_cmd = control_output[0] / (sysid_data.mass * gravity);
-    throttle_cmd = constrain_float(throttle_cmd, 0.1f, 0.9f);
+    // SAFETY: Validate parameters
+    if (sysid_data.mass <= 0.0f || sysid_data.arm_length <= 0.0f) {
+        gcs().send_text(MAV_SEVERITY_ERROR, "SMARTPHOTO99: Invalid params, using fallback");
+        use_attitude_controller_fallback();
+        return;
+    }
 
-    // Moment to attitude conversion
-    // Use empirical scaling based on system dynamics
-    float k_roll_att = 100.0f;   // N·m to radians
-    float k_pitch_att = 100.0f;  // N·m to radians
-    float k_yaw_rate = 20.0f;    // N·m to rad/s
-
-    float roll_cmd = control_output[1] / k_roll_att;
-    float pitch_cmd = control_output[2] / k_pitch_att;
-    float yaw_rate_cmd = control_output[3] / k_yaw_rate;
-
-    // Apply attitude limits
-    const float max_tilt_angle = attitude_control->lean_angle_max_rad();
-    roll_cmd = constrain_float(roll_cmd, -max_tilt_angle, max_tilt_angle);
-    pitch_cmd = constrain_float(pitch_cmd, -max_tilt_angle, max_tilt_angle);
-
-    const float max_yaw_rate = radians(90.0f);
-    yaw_rate_cmd = constrain_float(yaw_rate_cmd, -max_yaw_rate, max_yaw_rate);
-
-    // ========================================================================
-    // Send commands to ArduPilot's attitude controller
-    // ========================================================================
-
-    attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_rad(
-        roll_cmd, pitch_cmd, yaw_rate_cmd
+    // Step 1: Motor mixing (thrust + moments → individual motor thrusts)
+    float motor_thrust[4];  // Thrust per motor (N)
+    mix_motors_from_lqr(
+        control_output[0],  // Total thrust (N)
+        control_output[1],  // Roll moment (N·m)
+        control_output[2],  // Pitch moment (N·m)
+        control_output[3],  // Yaw moment (N·m)
+        motor_thrust
     );
 
-    attitude_control->set_throttle_out(throttle_cmd, true, g.throttle_filt);
+    // Step 2: Convert thrust to PWM
+    uint16_t motor_pwm[4];
+    thrust_to_pwm(motor_thrust, motor_pwm);
 
-    // Telemetry for monitoring
-    gcs().send_named_float("LQR_Thrust", control_output[0]);     // [N]
-    gcs().send_named_float("LQR_M_roll", control_output[1]);     // [N·m]
-    gcs().send_named_float("LQR_M_pitch", control_output[2]);    // [N·m]
-    gcs().send_named_float("LQR_M_yaw", control_output[3]);      // [N·m]
-    gcs().send_named_float("LQR_RollCmd", degrees(roll_cmd));    // [deg]
-    gcs().send_named_float("LQR_PitchCmd", degrees(pitch_cmd));  // [deg]
-    gcs().send_named_float("LQR_Throttle", throttle_cmd);        // [0-1]
+    // Step 3: Send directly to motors (bypass attitude controller)
+    motors->set_radio_passthrough(motor_pwm[0], motor_pwm[1], motor_pwm[2], motor_pwm[3]);
+
+    // Also update RC output for logging/monitoring
+    SRV_Channels::set_output_pwm(SRV_Channel::k_motor1, motor_pwm[0]);
+    SRV_Channels::set_output_pwm(SRV_Channel::k_motor2, motor_pwm[1]);
+    SRV_Channels::set_output_pwm(SRV_Channel::k_motor3, motor_pwm[2]);
+    SRV_Channels::set_output_pwm(SRV_Channel::k_motor4, motor_pwm[3]);
+
+    // Telemetry for monitoring (Pure LQR)
+    gcs().send_named_float("LQR_Thrust", control_output[0]);     // Total thrust [N]
+    gcs().send_named_float("LQR_M_roll", control_output[1]);     // Roll moment [N·m]
+    gcs().send_named_float("LQR_M_pitch", control_output[2]);    // Pitch moment [N·m]
+    gcs().send_named_float("LQR_M_yaw", control_output[3]);      // Yaw moment [N·m]
+    gcs().send_named_float("LQR_Motor0", motor_thrust[0]);       // Motor thrust [N]
+    gcs().send_named_float("LQR_Motor1", motor_thrust[1]);
+    gcs().send_named_float("LQR_Motor2", motor_thrust[2]);
+    gcs().send_named_float("LQR_Motor3", motor_thrust[3]);
+    gcs().send_named_float("LQR_PWM0", (float)motor_pwm[0]);     // Motor PWM
+    gcs().send_named_float("LQR_PWM1", (float)motor_pwm[1]);
+    gcs().send_named_float("LQR_PWM2", (float)motor_pwm[2]);
+    gcs().send_named_float("LQR_PWM3", (float)motor_pwm[3]);
 
     // Report execution every second
     if (state_feedback_counter % 100 == 0) {
