@@ -53,7 +53,7 @@ private:
     } safety_state;
 
     // Safety configuration parameters
-    static constexpr uint32_t COMPANION_TIMEOUT_MS = 5000;
+    static constexpr uint32_t COMPANION_TIMEOUT_MS = 12000;  // 12s: covers drain(1s)+wait_for_mode(5s)+M99_REF wait(5s)
     static constexpr float BATTERY_LOW_PERCENT = 30.0f;
     static constexpr float BATTERY_CRITICAL_PERCENT = 20.0f;
     static constexpr float MAX_WIND_SPEED_MS = 15.0f;
@@ -150,6 +150,8 @@ private:
     uint32_t last_wind_send_ms;
     uint32_t state_feedback_counter;
     uint32_t wind_send_counter;
+    uint32_t mode_entry_ms;          // timestamp of mode init — used to detect "no cmd yet"
+    uint32_t last_ref_broadcast_ms;  // last time M99_REF_* was broadcast
     static constexpr uint32_t STATE_FEEDBACK_DT_MS = 10;
     static constexpr uint32_t WIND_SEND_DT_MS = 10;
 
@@ -181,7 +183,7 @@ private:
     void mix_motors_from_lqr(float F_total, float M_roll, float M_pitch, float M_yaw, float motor_thrust[4]);
 
     // Safety monitoring
-    void check_failsafes();
+    bool check_failsafes();  // returns true if a failsafe was triggered (mode changed)
     bool check_battery_level();
     bool check_gps_ekf_health();
     bool check_companion_heartbeat();

@@ -21,7 +21,9 @@ ModeSmartPhoto99::ModeSmartPhoto99()
 {
     // sysid_data
     sysid_data.parameters_loaded = false;
-    sysid_data.mass = 1.0f;
+    // Default mass tuned for SITL: MOT_THST_HOVER=0.39 * 4motors * 8N/motor / 9.81 = 1.27 kg
+    // Reduces integral windup from model mismatch (sysid_params.txt overrides if found)
+    sysid_data.mass = 1.27f;
     sysid_data.Ixx = 0.01f;
     sysid_data.Iyy = 0.01f;
     sysid_data.Izz = 0.02f;
@@ -133,9 +135,12 @@ bool ModeSmartPhoto99::init(bool ignore_checks) {
     // Timing
     uint32_t now_ms = AP_HAL::millis();
     last_state_feedback_ms = now_ms;
-    last_wind_send_ms = now_ms;
+    last_wind_send_ms      = now_ms;
+    mode_entry_ms          = now_ms;
+    last_ref_broadcast_ms  = 0;       // force immediate first broadcast in run()
 
-    // Safety
+    // Safety — reset heartbeat timer so companion has COMPANION_TIMEOUT_MS from mode entry
+    safety_state.last_companion_msg_ms = now_ms;
     safety_state.gps_healthy = check_gps_ekf_health();
     safety_state.ekf_healthy = copter.ahrs.healthy();
     check_battery_level();
@@ -143,6 +148,7 @@ bool ModeSmartPhoto99::init(bool ignore_checks) {
     gcs().send_text(MAV_SEVERITY_INFO, "SMARTPHOTO99: EKF initialized");
     gcs().send_text(MAV_SEVERITY_INFO, "MODE99: LQI State Feedback @ 100Hz");
     gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Awaiting commands from companion @ 20Hz");
+    // M99_REF_* are broadcast at 1Hz in run() until first companion command arrives.
 
     return true;
 }
@@ -156,14 +162,16 @@ void ModeSmartPhoto99::run() {
     // Always update EKF states for failsafe checks
     get_ekf_states();
 
-    // Failsafe monitoring (continuous)
-    check_failsafes();
+    // Failsafe monitoring (continuous) — return immediately if mode was changed
+    if (check_failsafes()) {
+        return;
+    }
 
     // Enable motors
     motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
 
-    // Wind telemetry @ 100Hz
-    if (now_ms - last_wind_send_ms >= WIND_SEND_DT_MS) {
+    // Wind telemetry @ 1Hz (was 100Hz — rate-limited to avoid buffer overflow)
+    if (now_ms - last_wind_send_ms >= 1000) {
         last_wind_send_ms = now_ms;
         wind_send_counter++;
 
@@ -179,6 +187,18 @@ void ModeSmartPhoto99::run() {
         }
     }
 
+    // M99_REF_* broadcast @ 1Hz until companion sends first command.
+    // wait_for_mode() on the companion discards all non-HEARTBEAT messages, so the
+    // one-shot broadcast from init() is lost.  Repeating here ensures the companion
+    // receives the init reference regardless of timing.
+    if (safety_state.last_companion_msg_ms == mode_entry_ms &&
+        now_ms - last_ref_broadcast_ms >= 1000) {
+        last_ref_broadcast_ms = now_ms;
+        gcs().send_named_float("M99_REF_N", reference_state.pos_n);
+        gcs().send_named_float("M99_REF_E", reference_state.pos_e);
+        gcs().send_named_float("M99_REF_D", reference_state.pos_d);
+    }
+
     // LQI control @ 100Hz
     if (now_ms - last_state_feedback_ms >= STATE_FEEDBACK_DT_MS) {
         last_state_feedback_ms = now_ms;
@@ -186,11 +206,7 @@ void ModeSmartPhoto99::run() {
 
         const float dt = STATE_FEEDBACK_DT_MS * 0.001f;  // 0.01 s
 
-        // EKF predict + GPS update
-        ekf_predict(dt);
-        ekf_update_gps();
-
-        // Copy EKF state into current_state
+        // Get state from AHRS (custom QuatEKF removed — it diverges)
         get_ekf_states();
 
         // Update reference from companion or pilot
@@ -277,6 +293,21 @@ void ModeSmartPhoto99::run() {
 // ============================================================================
 void ModeSmartPhoto99::update_companion_command(const Vector3f& pos_ned, const Vector3f& vel_ned,
                                                  float yaw_target, float yaw_rate_target) {
+    // Reset integrators when altitude reference changes by more than 0.5m.
+    // Prevents windup from the old hover setpoint fighting the new climb target.
+    if (companion_cmd.valid) {
+        float dz = fabsf(pos_ned.z - companion_cmd.position_ned.z);
+        if (dz > 0.5f) {
+            lqi_state.int_pos_n = 0.0f;
+            lqi_state.int_pos_e = 0.0f;
+            lqi_state.int_pos_d = 0.0f;
+            lqi_state.int_vel_n = 0.0f;
+            lqi_state.int_vel_e = 0.0f;
+            lqi_state.int_vel_d = 0.0f;
+            gcs().send_text(MAV_SEVERITY_INFO, "MODE99: ref changed %.1fm, integrals reset", (double)dz);
+        }
+    }
+
     companion_cmd.position_ned = pos_ned;
     companion_cmd.velocity_ned = vel_ned;
     companion_cmd.yaw = yaw_target;
@@ -316,8 +347,16 @@ void ModeSmartPhoto99::use_attitude_controller_fallback() {
 // LOAD / APPLY PARAMETERS
 // ============================================================================
 bool ModeSmartPhoto99::load_identified_parameters() {
-    const char* filename = "sysid_params.txt";
-    int fd = AP::FS().open(filename, O_RDONLY);
+    // Try absolute SITL path first, fall back to CWD-relative
+    static const char* filenames[] = {
+        "/tmp/sitl_cowork/sysid_params.txt",
+        "sysid_params.txt",
+    };
+    int fd = -1;
+    for (const char* filename : filenames) {
+        fd = AP::FS().open(filename, O_RDONLY);
+        if (fd != -1) break;
+    }
     if (fd == -1) {
         return false;
     }
@@ -698,42 +737,34 @@ void ModeSmartPhoto99::ekf_update_gps() {
     }
 }
 
-// Copy EKF state into current_state struct
+// Copy state into current_state struct — always use ArduPilot AHRS (proven, stable).
+// The custom QuatEKF diverges in practice; AHRS (EKF3) is well-tuned and reliable.
 void ModeSmartPhoto99::get_ekf_states() {
-    if (!quat_ekf.initialized) {
-        // Seed from AHRS if EKF not yet running
-        Vector3p pos_ned;
-        if (ahrs.get_relative_position_NED_origin(pos_ned)) {
-            current_state.pos_n = pos_ned.x;
-            current_state.pos_e = pos_ned.y;
-            current_state.pos_d = pos_ned.z;
-        }
-        Vector3f vel_ned;
-        if (copter.ahrs.get_velocity_NED(vel_ned)) {
-            current_state.vel_n = vel_ned.x;
-            current_state.vel_e = vel_ned.y;
-            current_state.vel_d = vel_ned.z;
-        }
-        Quaternion q_ahrs;
-        copter.ahrs.get_quat_body_to_ned(q_ahrs);
-        current_state.q0 = q_ahrs.q1;
-        current_state.q1 = q_ahrs.q2;
-        current_state.q2 = q_ahrs.q3;
-        current_state.q3 = q_ahrs.q4;
-    } else {
-        current_state.pos_n = quat_ekf.x[0];
-        current_state.pos_e = quat_ekf.x[1];
-        current_state.pos_d = quat_ekf.x[2];
-        current_state.vel_n = quat_ekf.x[3];
-        current_state.vel_e = quat_ekf.x[4];
-        current_state.vel_d = quat_ekf.x[5];
-        current_state.q0    = quat_ekf.x[6];
-        current_state.q1    = quat_ekf.x[7];
-        current_state.q2    = quat_ekf.x[8];
-        current_state.q3    = quat_ekf.x[9];
+    // Position from AHRS
+    Vector3p pos_ned;
+    if (ahrs.get_relative_position_NED_origin(pos_ned)) {
+        current_state.pos_n = pos_ned.x;
+        current_state.pos_e = pos_ned.y;
+        current_state.pos_d = pos_ned.z;
     }
 
-    // Angular rates always from gyro
+    // Velocity from AHRS
+    Vector3f vel_ned;
+    if (copter.ahrs.get_velocity_NED(vel_ned)) {
+        current_state.vel_n = vel_ned.x;
+        current_state.vel_e = vel_ned.y;
+        current_state.vel_d = vel_ned.z;
+    }
+
+    // Attitude quaternion from AHRS
+    Quaternion q_ahrs;
+    copter.ahrs.get_quat_body_to_ned(q_ahrs);
+    current_state.q0 = q_ahrs.q1;  // w
+    current_state.q1 = q_ahrs.q2;  // x
+    current_state.q2 = q_ahrs.q3;  // y
+    current_state.q3 = q_ahrs.q4;  // z
+
+    // Angular rates from gyro
     Vector3f gyro = copter.ins.get_gyro();
     current_state.roll_rate  = gyro.x;
     current_state.pitch_rate = gyro.y;
@@ -761,18 +792,20 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
 
     // Q diagonal (18 weights)
     // [pos(3), vel(3), att_err(3), rate(3), int_pos(3), int_vel(3)]
+    // Altitude (index 2,5,14,17) tuned conservatively: prev Q[2]=2,Q[5]=3,R[0]=0.1
+    // caused K[0][2]=-21.9 → 3m error → +66N → immediate clamp → 52m overshoot.
     float Q[18] = {
-        1.0f, 1.0f, 2.0f,           // pos_n, pos_e, pos_d
-        2.0f, 2.0f, 3.0f,           // vel_n, vel_e, vel_d
+        1.0f, 1.0f, 0.5f,           // pos_n, pos_e, pos_d  (reduced pos_d: 2→0.5)
+        2.0f, 2.0f, 1.0f,           // vel_n, vel_e, vel_d  (reduced vel_d: 3→1)
         10.0f, 10.0f, 5.0f,         // att_err roll, pitch, yaw
         1.0f, 1.0f, 0.5f,           // p, q, r
-        0.5f, 0.5f, 0.5f,           // int_pos_n, int_pos_e, int_pos_d
-        0.3f, 0.3f, 0.3f            // int_vel_n, int_vel_e, int_vel_d
+        0.5f, 0.5f, 0.2f,           // int_pos_n, int_pos_e, int_pos_d (reduced: 0.5→0.2)
+        0.3f, 0.3f, 0.1f            // int_vel_n, int_vel_e, int_vel_d (reduced: 0.3→0.1)
     };
 
     // R diagonal (4 weights)
     float R[4] = {
-        0.1f,   // F_thrust
+        1.0f,   // F_thrust  (increased: 0.1→1.0, reduces altitude gain aggressiveness)
         1.0f,   // M_roll
         1.0f,   // M_pitch
         2.0f    // M_yaw
@@ -786,10 +819,13 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
     }
 
     // --- Row 0: Thrust channel (pos_d, vel_d, int_pos_d, int_vel_d) ---
-    lqr_gains.K[0][2]  = sqrtf(Q[2]  / R[0]) * sysid_data.mass * gravity * 0.5f;   // pos_d
-    lqr_gains.K[0][5]  = sqrtf(Q[5]  / R[0]) * sysid_data.mass * 2.0f;             // vel_d
-    lqr_gains.K[0][14] = sqrtf(Q[14] / R[0]) * sysid_data.mass * gravity * 0.3f;   // int_pos_d
-    lqr_gains.K[0][17] = sqrtf(Q[17] / R[0]) * sysid_data.mass * 1.0f;             // int_vel_d
+    // NED convention: pos_d positive = DOWN, thrust acts upward (negative NED direction).
+    // B matrix for altitude: δpos_d'' = -δF/m (negative sign).
+    // For u = u_hover - K*e stability, altitude gains must be NEGATIVE.
+    lqr_gains.K[0][2]  = -sqrtf(Q[2]  / R[0]) * sysid_data.mass * gravity * 0.5f;  // pos_d (neg)
+    lqr_gains.K[0][5]  = -sqrtf(Q[5]  / R[0]) * sysid_data.mass * 2.0f;            // vel_d (neg)
+    lqr_gains.K[0][14] = -sqrtf(Q[14] / R[0]) * sysid_data.mass * gravity * 0.3f;  // int_pos_d (neg)
+    lqr_gains.K[0][17] = -sqrtf(Q[17] / R[0]) * sysid_data.mass * 1.0f;            // int_vel_d (neg)
 
     // --- Row 1: Roll moment (pos_e, vel_e, att_roll, rate_p, int_pos_e, int_vel_e) ---
     lqr_gains.K[1][1]  = sqrtf(Q[1]  / R[1]) * gravity * 0.3f;                     // pos_e
@@ -982,34 +1018,56 @@ void ModeSmartPhoto99::compute_lqi_control() {
     motors->set_throttle(throttle_norm);
     // motors->output() is called by the scheduler
 
-    // Telemetry
-    gcs().send_named_float("LQI_Thrust", u[0]);
-    gcs().send_named_float("LQI_M_roll", u[1]);
-    gcs().send_named_float("LQI_M_pitch", u[2]);
-    gcs().send_named_float("LQI_M_yaw", u[3]);
-    gcs().send_named_float("MTR0", t0);
-    gcs().send_named_float("MTR1", t1);
-    gcs().send_named_float("MTR2", t2);
-    gcs().send_named_float("MTR3", t3);
-    gcs().send_named_float("EKF_q0", current_state.q0);
-    gcs().send_named_float("EKF_q1", current_state.q1);
-    gcs().send_named_float("EKF_q2", current_state.q2);
-    gcs().send_named_float("EKF_q3", current_state.q3);
-    gcs().send_named_float("EKF_vN", current_state.vel_n);
-    gcs().send_named_float("EKF_vE", current_state.vel_e);
-    gcs().send_named_float("EKF_vD", current_state.vel_d);
-    gcs().send_named_float("INT_pN", lqi_state.int_pos_n);
-    gcs().send_named_float("INT_pE", lqi_state.int_pos_e);
-    gcs().send_named_float("INT_pD", lqi_state.int_pos_d);
-    gcs().send_named_float("INT_vN", lqi_state.int_vel_n);
-    gcs().send_named_float("INT_vE", lqi_state.int_vel_e);
-    gcs().send_named_float("INT_vD", lqi_state.int_vel_d);
+    // Telemetry @ 1Hz (rate-limited to avoid buffer overflow at 100Hz)
+    const uint32_t now_ms = AP_HAL::millis();
+    static uint32_t last_named_float_ms = 0;
+    if (now_ms - last_named_float_ms >= 1000) {
+        last_named_float_ms = now_ms;
+        gcs().send_named_float("LQI_Thrust", u[0]);
+        gcs().send_named_float("LQI_M_roll", u[1]);
+        gcs().send_named_float("LQI_M_pitch", u[2]);
+        gcs().send_named_float("LQI_M_yaw", u[3]);
+        gcs().send_named_float("MTR0", t0);
+        gcs().send_named_float("MTR1", t1);
+        gcs().send_named_float("MTR2", t2);
+        gcs().send_named_float("MTR3", t3);
+        gcs().send_named_float("EKF_q0", current_state.q0);
+        gcs().send_named_float("EKF_q1", current_state.q1);
+        gcs().send_named_float("EKF_q2", current_state.q2);
+        gcs().send_named_float("EKF_q3", current_state.q3);
+        gcs().send_named_float("EKF_vN", current_state.vel_n);
+        gcs().send_named_float("EKF_vE", current_state.vel_e);
+        gcs().send_named_float("EKF_vD", current_state.vel_d);
+        gcs().send_named_float("INT_pN", lqi_state.int_pos_n);
+        gcs().send_named_float("INT_pE", lqi_state.int_pos_e);
+        gcs().send_named_float("INT_pD", lqi_state.int_pos_d);
+        gcs().send_named_float("INT_vN", lqi_state.int_vel_n);
+        gcs().send_named_float("INT_vE", lqi_state.int_vel_e);
+        gcs().send_named_float("INT_vD", lqi_state.int_vel_d);
+        gcs().send_named_float("EKF_pD", current_state.pos_d);
+        gcs().send_named_float("REF_pD", reference_state.pos_d);
+        gcs().send_named_float("ERR_pD", e[2]);
+        gcs().send_named_float("ERR_vD", e[5]);
+        gcs().send_named_float("THR_out", throttle_norm);
+    }
+
+    // STATUSTEXT debug @ 1Hz — bypasses named-float buffer, always current
+    static uint32_t last_debug_ms = 0;
+    if (now_ms - last_debug_ms >= 1000) {
+        last_debug_ms = now_ms;
+        gcs().send_text(MAV_SEVERITY_INFO,
+            "M99 ref=%.2f cur=%.2f thr=%.3f int=%.2f",
+            (double)reference_state.pos_d,
+            (double)current_state.pos_d,
+            (double)throttle_norm,
+            (double)lqi_state.int_pos_d);
+    }
 }
 
 // ============================================================================
 // FAILSAFE MONITORING
 // ============================================================================
-void ModeSmartPhoto99::check_failsafes() {
+bool ModeSmartPhoto99::check_failsafes() {
     safety_state.gps_healthy = check_gps_ekf_health();
     safety_state.ekf_healthy = copter.ahrs.healthy();
     check_battery_level();
@@ -1018,28 +1076,28 @@ void ModeSmartPhoto99::check_failsafes() {
     if (!check_companion_heartbeat() && motors->armed()) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: COMPANION HEARTBEAT LOST - LAND");
         copter.set_mode(Mode::Number::LAND, ModeReason::RADIO_FAILSAFE);
-        return;
+        return true;
     }
 
     // 2. Battery critical
     if (safety_state.battery_critical && motors->armed()) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: BATTERY CRITICAL - LAND");
         copter.set_mode(Mode::Number::LAND, ModeReason::BATTERY_FAILSAFE);
-        return;
+        return true;
     }
 
     // 3. EKF failure
     if (!safety_state.ekf_healthy && motors->armed()) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: EKF FAILURE - LAND");
         copter.set_mode(Mode::Number::LAND, ModeReason::EKF_FAILSAFE);
-        return;
+        return true;
     }
 
     // 4. GPS failure
     if (!safety_state.gps_healthy && motors->armed()) {
         gcs().send_text(MAV_SEVERITY_CRITICAL, "MODE99: GPS FAILURE - LAND");
         copter.set_mode(Mode::Number::LAND, ModeReason::GPS_GLITCH);
-        return;
+        return true;
     }
 
     // Wind warning
@@ -1055,6 +1113,8 @@ void ModeSmartPhoto99::check_failsafes() {
             }
         }
     }
+
+    return false;
 }
 
 bool ModeSmartPhoto99::check_battery_level() {
