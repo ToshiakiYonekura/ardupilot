@@ -171,6 +171,7 @@ private:
     // LQI control functions
     // =========================================================================
     bool load_identified_parameters();
+    bool load_lqr_gains_from_file();   // loads K (4x18) from lqr_gains.txt if present
     void apply_identified_parameters();
     void calculate_lqr_gains();
     void get_ekf_states();
