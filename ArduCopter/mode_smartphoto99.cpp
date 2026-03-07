@@ -19,14 +19,13 @@
 // ============================================================================
 ModeSmartPhoto99::ModeSmartPhoto99()
 {
-    // sysid_data
+    // sysid_data — defaults mirror sysid_params.txt so fallback gains are correct
+    // if sysid_params.txt is not found at runtime.
     sysid_data.parameters_loaded = false;
-    // Default mass tuned for SITL: MOT_THST_HOVER=0.39 * 4motors * 8N/motor / 9.81 = 1.27 kg
-    // Reduces integral windup from model mismatch (sysid_params.txt overrides if found)
-    sysid_data.mass = 1.27f;
-    sysid_data.Ixx = 0.01f;
-    sysid_data.Iyy = 0.01f;
-    sysid_data.Izz = 0.02f;
+    sysid_data.mass = 2.0f;       // MASS=2.0
+    sysid_data.Ixx  = 0.0347f;   // IXX=0.0347
+    sysid_data.Iyy  = 0.0458f;   // IYY=0.0458
+    sysid_data.Izz  = 0.0977f;   // IZZ=0.0977
     sysid_data.motor_kv = 0.0f;
     sysid_data.max_thrust_per_motor = 8.0f;
     sysid_data.arm_length = 0.225f;
@@ -869,8 +868,8 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
     if (sysid_data.mass <= 0.0f || sysid_data.mass > 100.0f) {
         gcs().send_text(MAV_SEVERITY_ERROR, "SMARTPHOTO99: Invalid mass %.2f kg, using defaults",
                         (double)sysid_data.mass);
-        // Use defaults so gains can still be computed
-        sysid_data.mass = 1.5f;
+        // Use sysid default so gains can still be computed
+        sysid_data.mass = 2.0f;
     }
     if (sysid_data.Ixx <= 0.0f) sysid_data.Ixx = 0.01f;
     if (sysid_data.Iyy <= 0.0f) sysid_data.Iyy = 0.01f;
