@@ -982,14 +982,16 @@ void ModeSmartPhoto99::get_error_state_18(float e[18]) const {
     // Clamp to MAX_POS_ERR to prevent LQR saturation and flip when large
     // position targets are commanded (e.g. during RL training random exploration
     // or large waypoint jumps from the companion computer).
-    const float MAX_POS_ERR = 5.0f;  // meters
+    // Keep clamp tight: 2m position, 2m/s velocity.
+    // Larger values still produce tilt > 60° which causes altitude loss.
+    const float MAX_POS_ERR = 2.0f;  // meters
     e[0] = constrain_float(current_state.pos_n - reference_state.pos_n, -MAX_POS_ERR, MAX_POS_ERR);
     e[1] = constrain_float(current_state.pos_e - reference_state.pos_e, -MAX_POS_ERR, MAX_POS_ERR);
     e[2] = constrain_float(current_state.pos_d - reference_state.pos_d, -MAX_POS_ERR, MAX_POS_ERR);
 
     // Velocity error [3..5]
     // Clamp to MAX_VEL_ERR to prevent aggressive deceleration commands at high speed.
-    const float MAX_VEL_ERR = 5.0f;  // m/s
+    const float MAX_VEL_ERR = 2.0f;  // m/s
     e[3] = constrain_float(current_state.vel_n - reference_state.vel_n, -MAX_VEL_ERR, MAX_VEL_ERR);
     e[4] = constrain_float(current_state.vel_e - reference_state.vel_e, -MAX_VEL_ERR, MAX_VEL_ERR);
     e[5] = constrain_float(current_state.vel_d - reference_state.vel_d, -MAX_VEL_ERR, MAX_VEL_ERR);
