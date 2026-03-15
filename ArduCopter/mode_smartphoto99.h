@@ -103,8 +103,8 @@ private:
     struct LQIState {
         float int_pos_n, int_pos_e, int_pos_d;    // Position integral [m·s]
         float int_vel_n, int_vel_e, int_vel_d;    // Velocity integral [(m/s)·s]
-        static constexpr float MAX_POS_INT = 10.0f;
-        static constexpr float MAX_VEL_INT = 5.0f;
+        static constexpr float MAX_POS_INT = 2.0f;   // reduced from 10.0 (anti-windup)
+        static constexpr float MAX_VEL_INT = 2.0f;   // reduced from 5.0  (anti-windup)
     } lqi_state;
 
     // State vector (uses EKF quaternion, not Euler)

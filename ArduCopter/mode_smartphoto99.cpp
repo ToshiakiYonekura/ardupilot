@@ -955,15 +955,21 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
 // INTEGRAL STATE UPDATE
 // ============================================================================
 void ModeSmartPhoto99::update_integral_states(float dt) {
-    // e_int_pos += (ref_pos - current_pos) * dt
-    lqi_state.int_pos_n += (reference_state.pos_n - current_state.pos_n) * dt;
-    lqi_state.int_pos_e += (reference_state.pos_e - current_state.pos_e) * dt;
-    lqi_state.int_pos_d += (reference_state.pos_d - current_state.pos_d) * dt;
+    // e_int_pos += clamped(ref_pos - current_pos) * dt
+    // Use the same clamp as get_error_state_18() so the integrator cannot
+    // wind up faster than what the LQR actually sees. Without this, a 50m
+    // position error saturates the integrator in <1 second even though the
+    // LQR only receives 2m, causing large integral-driven moment commands.
+    const float MAX_POS_ERR_INT = 2.0f;
+    const float MAX_VEL_ERR_INT = 2.0f;
+    lqi_state.int_pos_n += constrain_float(reference_state.pos_n - current_state.pos_n, -MAX_POS_ERR_INT, MAX_POS_ERR_INT) * dt;
+    lqi_state.int_pos_e += constrain_float(reference_state.pos_e - current_state.pos_e, -MAX_POS_ERR_INT, MAX_POS_ERR_INT) * dt;
+    lqi_state.int_pos_d += constrain_float(reference_state.pos_d - current_state.pos_d, -MAX_POS_ERR_INT, MAX_POS_ERR_INT) * dt;
 
-    // e_int_vel += (ref_vel - current_vel) * dt
-    lqi_state.int_vel_n += (reference_state.vel_n - current_state.vel_n) * dt;
-    lqi_state.int_vel_e += (reference_state.vel_e - current_state.vel_e) * dt;
-    lqi_state.int_vel_d += (reference_state.vel_d - current_state.vel_d) * dt;
+    // e_int_vel += clamped(ref_vel - current_vel) * dt
+    lqi_state.int_vel_n += constrain_float(reference_state.vel_n - current_state.vel_n, -MAX_VEL_ERR_INT, MAX_VEL_ERR_INT) * dt;
+    lqi_state.int_vel_e += constrain_float(reference_state.vel_e - current_state.vel_e, -MAX_VEL_ERR_INT, MAX_VEL_ERR_INT) * dt;
+    lqi_state.int_vel_d += constrain_float(reference_state.vel_d - current_state.vel_d, -MAX_VEL_ERR_INT, MAX_VEL_ERR_INT) * dt;
 
     // Anti-windup clamp
     lqi_state.int_pos_n = constrain_float(lqi_state.int_pos_n, -LQIState::MAX_POS_INT, LQIState::MAX_POS_INT);
