@@ -324,7 +324,14 @@ void ModeSmartPhoto99::update_companion_command(const Vector3f& pos_ned, const V
 
     if (!smoothing.use_companion_cmd) {
         smoothing.use_companion_cmd = true;
-        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Companion control enabled");
+        // Reset integrators on first companion command to prevent windup from initial transient
+        lqi_state.int_pos_n = 0.0f;
+        lqi_state.int_pos_e = 0.0f;
+        lqi_state.int_pos_d = 0.0f;
+        lqi_state.int_vel_n = 0.0f;
+        lqi_state.int_vel_e = 0.0f;
+        lqi_state.int_vel_d = 0.0f;
+        gcs().send_text(MAV_SEVERITY_INFO, "MODE99: Companion control enabled, integrals reset");
     }
 }
 
@@ -884,12 +891,12 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
     // Altitude (index 2,5,14,17) tuned conservatively: prev Q[2]=2,Q[5]=3,R[0]=0.1
     // caused K[0][2]=-21.9 → 3m error → +66N → immediate clamp → 52m overshoot.
     float Q[18] = {
-        1.0f, 1.0f, 0.5f,           // pos_n, pos_e, pos_d  (reduced pos_d: 2→0.5)
-        2.0f, 2.0f, 1.0f,           // vel_n, vel_e, vel_d  (reduced vel_d: 3→1)
+        0.05f, 0.05f, 0.5f,         // pos_n, pos_e, pos_d (reduced: 1.0→0.05, max tilt <10° for 0.5m error)
+        0.05f, 0.05f, 1.0f,         // vel_n, vel_e, vel_d  (vel_n/e for damping only, no vel reference)
         10.0f, 10.0f, 5.0f,         // att_err roll, pitch, yaw
         1.0f, 1.0f, 0.5f,           // p, q, r
         0.5f, 0.5f, 0.2f,           // int_pos_n, int_pos_e, int_pos_d (reduced: 0.5→0.2)
-        0.3f, 0.3f, 0.1f            // int_vel_n, int_vel_e, int_vel_d (reduced: 0.3→0.1)
+        0.0f, 0.0f, 0.1f            // int_vel_n=0, int_vel_e=0 (disabled: RL random cmds cause windup→flip), int_vel_d
     };
 
     // R diagonal (4 weights)
@@ -972,14 +979,20 @@ void ModeSmartPhoto99::update_integral_states(float dt) {
 // ============================================================================
 void ModeSmartPhoto99::get_error_state_18(float e[18]) const {
     // Position error [0..2]
-    e[0] = current_state.pos_n - reference_state.pos_n;
-    e[1] = current_state.pos_e - reference_state.pos_e;
-    e[2] = current_state.pos_d - reference_state.pos_d;
+    // Clamp to MAX_POS_ERR to prevent LQR saturation and flip when large
+    // position targets are commanded (e.g. during RL training random exploration
+    // or large waypoint jumps from the companion computer).
+    const float MAX_POS_ERR = 5.0f;  // meters
+    e[0] = constrain_float(current_state.pos_n - reference_state.pos_n, -MAX_POS_ERR, MAX_POS_ERR);
+    e[1] = constrain_float(current_state.pos_e - reference_state.pos_e, -MAX_POS_ERR, MAX_POS_ERR);
+    e[2] = constrain_float(current_state.pos_d - reference_state.pos_d, -MAX_POS_ERR, MAX_POS_ERR);
 
     // Velocity error [3..5]
-    e[3] = current_state.vel_n - reference_state.vel_n;
-    e[4] = current_state.vel_e - reference_state.vel_e;
-    e[5] = current_state.vel_d - reference_state.vel_d;
+    // Clamp to MAX_VEL_ERR to prevent aggressive deceleration commands at high speed.
+    const float MAX_VEL_ERR = 5.0f;  // m/s
+    e[3] = constrain_float(current_state.vel_n - reference_state.vel_n, -MAX_VEL_ERR, MAX_VEL_ERR);
+    e[4] = constrain_float(current_state.vel_e - reference_state.vel_e, -MAX_VEL_ERR, MAX_VEL_ERR);
+    e[5] = constrain_float(current_state.vel_d - reference_state.vel_d, -MAX_VEL_ERR, MAX_VEL_ERR);
 
     // Attitude error from quaternion [6..8]
     // q_ref (reference): [q0,q1,q2,q3]
@@ -1058,13 +1071,23 @@ void ModeSmartPhoto99::compute_lqi_control() {
     const float gravity = GRAVITY_MSS;
     float hover_thrust_N = sysid_data.mass * gravity;
 
+    // Tilt compensation: boost thrust to maintain vertical component when tilted
+    // cos_tilt = 1 - 2*(q1^2 + q2^2) = q0^2 - q1^2 - q2^2 + q3^2 ... simplified:
+    // For small angles: cos_tilt ≈ q0^2 + q3^2 - q1^2 - q2^2
+    // More directly: R_zz (body z projected on world z) = 1 - 2*(q1^2 + q2^2)
+    float q1 = current_state.q1;
+    float q2 = current_state.q2;
+    float cos_tilt = 1.0f - 2.0f * (q1*q1 + q2*q2);
+    cos_tilt = constrain_float(cos_tilt, 0.5f, 1.0f);  // limit to ~60 deg max tilt
+    float feedforward_thrust = hover_thrust_N / cos_tilt;
+
     // Build 18-element error state
     float e[18];
     get_error_state_18(e);
 
     // Control law: u = u_hover - K * e
     float u[4];
-    u[0] = hover_thrust_N;  // feedforward thrust
+    u[0] = feedforward_thrust;  // feedforward thrust with tilt compensation
     u[1] = 0.0f;
     u[2] = 0.0f;
     u[3] = 0.0f;
@@ -1088,11 +1111,16 @@ void ModeSmartPhoto99::compute_lqi_control() {
     // =========================================================================
     // MOTOR OUTPUT FIX: normalize to [0,1] then reverse-mix to AP_Motors API
     // =========================================================================
-    float max_t = sysid_data.max_thrust_per_motor;
-    float t0 = constrain_float(motor_thrust[0] / max_t, 0.0f, 1.0f);
-    float t1 = constrain_float(motor_thrust[1] / max_t, 0.0f, 1.0f);
-    float t2 = constrain_float(motor_thrust[2] / max_t, 0.0f, 1.0f);
-    float t3 = constrain_float(motor_thrust[3] / max_t, 0.0f, 1.0f);
+    // Scale max_thrust so that hover maps to MOT_THST_HOVER (0.5).
+    // LQR computes hover thrust = mass*g. Without scaling, throttle_norm at hover
+    // would be mass*g/(4*max_thrust) = 0.613, but AP_Motors expects 0.5 for hover.
+    // Correction: scale max_thrust so that hover_thrust/(4*max_t_scaled) = throttle_hover.
+    float throttle_hover = sysid_data.throttle_hover > 0.0f ? sysid_data.throttle_hover : 0.5f;
+    float max_t_scaled = hover_thrust_N / (4.0f * throttle_hover);  // = mass*g / (4*0.5) = mass*g/2
+    float t0 = constrain_float(motor_thrust[0] / max_t_scaled, 0.0f, 1.0f);
+    float t1 = constrain_float(motor_thrust[1] / max_t_scaled, 0.0f, 1.0f);
+    float t2 = constrain_float(motor_thrust[2] / max_t_scaled, 0.0f, 1.0f);
+    float t3 = constrain_float(motor_thrust[3] / max_t_scaled, 0.0f, 1.0f);
 
     // Reverse-mix to roll/pitch/yaw/throttle for AP_Motors (X-config)
     // FL=t0, FR=t1, RL=t2, RR=t3
