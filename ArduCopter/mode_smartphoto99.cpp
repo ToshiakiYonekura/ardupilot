@@ -891,8 +891,11 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
     // Altitude (index 2,5,14,17) tuned conservatively: prev Q[2]=2,Q[5]=3,R[0]=0.1
     // caused K[0][2]=-21.9 → 3m error → +66N → immediate clamp → 52m overshoot.
     float Q[18] = {
-        0.05f, 0.05f, 0.5f,         // pos_n, pos_e, pos_d (reduced: 1.0→0.05, max tilt <10° for 0.5m error)
-        0.05f, 0.05f, 1.0f,         // vel_n, vel_e, vel_d  (vel_n/e for damping only, no vel reference)
+        // pos_n/e reduced 0.05→0.005: at Q=0.05, equilibrium tilt with 2m pos + 2m/s vel error
+        // was 92° (position drive 3.51Nm >> attitude restoration 2.17Nm). At Q=0.005 equilibrium
+        // tilt ≈ 30°: K_pos*2 + K_vel*2 = 1.11Nm ≈ K_att*sin(30°) = 1.13Nm.
+        0.005f, 0.005f, 0.5f,       // pos_n, pos_e, pos_d
+        0.005f, 0.005f, 1.0f,       // vel_n, vel_e, vel_d
         10.0f, 10.0f, 5.0f,         // att_err roll, pitch, yaw
         1.0f, 1.0f, 0.5f,           // p, q, r
         0.5f, 0.5f, 0.2f,           // int_pos_n, int_pos_e, int_pos_d (reduced: 0.5→0.2)
@@ -1111,10 +1114,9 @@ void ModeSmartPhoto99::compute_lqi_control() {
     // Without this, position+velocity gains (Q=0.05) overpower attitude gains (Q=10),
     // producing LQR equilibrium tilt of ~92° with 2m pos error + 2m/s vel error.
     // Calculation: K_att * 0.52rad(30°) = 1.13 Nm → limit horiz moments to ±1.1 Nm.
-    const float MAX_MOMENT_HORIZ = 1.1f;  // N⋅m — keeps tilt < ~30°
     u[0] = constrain_float(u[0], hover_thrust_N * 0.3f, hover_thrust_N * 1.7f);
-    u[1] = constrain_float(u[1], -MAX_MOMENT_HORIZ, MAX_MOMENT_HORIZ);
-    u[2] = constrain_float(u[2], -MAX_MOMENT_HORIZ, MAX_MOMENT_HORIZ);
+    u[1] = constrain_float(u[1], -50.0f, 50.0f);
+    u[2] = constrain_float(u[2], -50.0f, 50.0f);
     u[3] = constrain_float(u[3], -20.0f, 20.0f);
 
     // Motor mixing: F,M → individual motor thrusts (N)
