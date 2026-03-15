@@ -897,8 +897,12 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
         0.005f, 0.005f, 0.5f,       // pos_n, pos_e, pos_d
         0.005f, 0.005f, 1.0f,       // vel_n, vel_e, vel_d
         10.0f, 10.0f, 5.0f,         // att_err roll, pitch, yaw
-        1.0f, 1.0f, 0.5f,           // p, q, r
-        0.5f, 0.5f, 0.2f,           // int_pos_n, int_pos_e, int_pos_d (reduced: 0.5→0.2)
+        // Rate damping increased 1.0→20.0 for roll/pitch.
+        // With Q[pos]=0.005, equilibrium tilt ≈ 30° but ζ=0.217 (underdamped) caused
+        // 50% overshoot → 45°+. Need Q[p,q]≥10.3 for ζ≥0.7 (critically damped).
+        // K_damp = sqrt(20)*Iyy*3 = 0.614 → ζ = 0.975 ≈ 1 (no overshoot).
+        20.0f, 20.0f, 0.5f,         // p, q, r
+        0.0f, 0.0f, 0.2f,           // int_pos_n=0 (disabled: RL random cmds → windup dominates flip), int_pos_e=0, int_pos_d
         0.0f, 0.0f, 0.1f            // int_vel_n=0, int_vel_e=0 (disabled: RL random cmds cause windup→flip), int_vel_d
     };
 
