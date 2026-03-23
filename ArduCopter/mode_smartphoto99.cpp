@@ -264,6 +264,21 @@ void ModeSmartPhoto99::run() {
             reference_state.vel_d = 0.0f;
         }
 
+        // Speed governor: blend vel_ref toward current_vel as speed approaches MAX_HORIZ_SPEED.
+        // alpha = speed / MAX_HORIZ_SPEED (clamped to 1.0)
+        //   alpha=0: vel_ref unchanged (full LQR authority)
+        //   alpha=1: vel_ref = current_vel → vel_error = 0 → zero net acceleration
+        // This tapers acceleration to zero at the speed limit, and for speeds above the
+        // limit the excess creates a proportional braking error (same as before).
+        const float MAX_HORIZ_SPEED = 5.0f;  // m/s
+        float hs = sqrtf(current_state.vel_n * current_state.vel_n +
+                          current_state.vel_e * current_state.vel_e);
+        {
+            float alpha = constrain_float(hs / MAX_HORIZ_SPEED, 0.0f, 1.0f);
+            reference_state.vel_n = (1.0f - alpha) * reference_state.vel_n + alpha * current_state.vel_n;
+            reference_state.vel_e = (1.0f - alpha) * reference_state.vel_e + alpha * current_state.vel_e;
+        }
+
         // Reference attitude: level flight at commanded yaw
         Quaternion q_ref;
         q_ref.from_euler(0.0f, 0.0f, target_yaw);
@@ -1001,6 +1016,30 @@ void ModeSmartPhoto99::get_error_state_18(float e[18]) const {
     e[0] = constrain_float(current_state.pos_n - reference_state.pos_n, -MAX_POS_ERR, MAX_POS_ERR);
     e[1] = constrain_float(current_state.pos_e - reference_state.pos_e, -MAX_POS_ERR, MAX_POS_ERR);
     e[2] = constrain_float(current_state.pos_d - reference_state.pos_d, -MAX_POS_ERR, MAX_POS_ERR);
+
+    // Speed-based forward acceleration suppressor.
+    // At high speed, LQR position error can still command forward tilt even when
+    // vel_error = 0 (e.g. target is ahead of the drone).  Suppress the position
+    // error component in the direction of motion proportional to speed / MAX_SPEED.
+    //   alpha=0 (low speed)  → pos_error unchanged (normal LQR)
+    //   alpha=1 (MAX_SPEED)  → forward pos_error zeroed (no acceleration)
+    // Backward pos_error (deceleration) is left untouched so braking still works.
+    const float MAX_HORIZ_SPEED_PE = 5.0f;  // m/s — matches vel_ref governor above
+    float hs_pe = sqrtf(current_state.vel_n * current_state.vel_n +
+                         current_state.vel_e * current_state.vel_e);
+    if (hs_pe > 0.1f) {
+        float alpha_pe = constrain_float(hs_pe / MAX_HORIZ_SPEED_PE, 0.0f, 1.0f);
+        float vel_unit_n = current_state.vel_n / hs_pe;
+        float vel_unit_e = current_state.vel_e / hs_pe;
+        // Project pos_error onto direction of motion (negative = target ahead = accelerating)
+        float fwd_component = e[0] * vel_unit_n + e[1] * vel_unit_e;
+        if (fwd_component < 0.0f) {
+            // Target is ahead — suppress this accelerating component
+            e[0] -= vel_unit_n * fwd_component * alpha_pe;
+            e[1] -= vel_unit_e * fwd_component * alpha_pe;
+        }
+        // fwd_component > 0 means target is behind (deceleration) — leave untouched
+    }
 
     // Velocity error [3..5]
     // Clamp to MAX_VEL_ERR to prevent aggressive deceleration commands at high speed.
