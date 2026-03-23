@@ -942,12 +942,20 @@ void ModeSmartPhoto99::calculate_lqr_gains() {
     lqr_gains.K[1][16] = sqrtf(Q[16] / R[1]) * gravity * 0.3f;                     // int_vel_e
 
     // --- Row 2: Pitch moment (pos_n, vel_n, att_pitch, rate_q, int_pos_n, int_vel_n) ---
-    lqr_gains.K[2][0]  = sqrtf(Q[0]  / R[2]) * gravity * 0.3f;                     // pos_n
-    lqr_gains.K[2][3]  = sqrtf(Q[3]  / R[2]) * gravity * 0.5f;                     // vel_n
+    // NEGATIVE: north position error → nose-down (u[2] negative) → brake. u = u_hover - K*e,
+    // so K[2][0..] must be positive for the SUBTRACTION to produce a braking moment.
+    // Wait: u[2] = -K[2]*e. Moving north (pos_n > ref pos_n when ref=0) → e_pos_n < 0 (ref-cur).
+    // Actually e = ref - current. If drone is north of ref, e_pos_n < 0 → K[2][0]*e_pos_n < 0 → u[2]<0 → nose-up → MORE north. WRONG.
+    // For DARE-computed gains: K[2][0] = -0.138 (negative), K[2][3] = -0.405 (negative).
+    // When drone moves north (vel_n > 0): e_vel_n = ref_vel_n - vel_n < 0 → K[2][3]*e_vel_n > 0 (if K negative) → u[2] > 0 → nose-up? No.
+    // u[2] = u_hover[2] - K[2]*e. u_hover[2]=0. K[2][3]=−0.405, e_vel_n<0 → K[2][3]*e_vel_n = (−0.405)(neg)=positive → u[2]=−positive<0 → nose-down. ✓ Brakes.
+    // So K[2][0] and K[2][3] must be NEGATIVE to produce braking (nose-down when overshooting north).
+    lqr_gains.K[2][0]  = -sqrtf(Q[0]  / R[2]) * gravity * 0.3f;                    // pos_n  (neg: match DARE sign)
+    lqr_gains.K[2][3]  = -sqrtf(Q[3]  / R[2]) * gravity * 0.5f;                    // vel_n  (neg: brake when moving north)
     lqr_gains.K[2][7]  = sqrtf(Q[7]  / R[2]) * sysid_data.Iyy * 15.0f;             // att_err pitch
     lqr_gains.K[2][10] = sqrtf(Q[10] / R[2]) * sysid_data.Iyy * 3.0f;              // rate q
-    lqr_gains.K[2][12] = sqrtf(Q[12] / R[2]) * gravity * 0.2f;                     // int_pos_n
-    lqr_gains.K[2][15] = sqrtf(Q[15] / R[2]) * gravity * 0.3f;                     // int_vel_n
+    lqr_gains.K[2][12] = -sqrtf(Q[12] / R[2]) * gravity * 0.2f;                    // int_pos_n (neg: match DARE sign)
+    lqr_gains.K[2][15] = -sqrtf(Q[15] / R[2]) * gravity * 0.3f;                    // int_vel_n (neg: match DARE sign)
 
     // --- Row 3: Yaw moment (att_yaw, rate_r) ---
     lqr_gains.K[3][8]  = sqrtf(Q[8]  / R[3]) * sysid_data.Izz * 8.0f;              // att_err yaw
@@ -1006,8 +1014,9 @@ void ModeSmartPhoto99::get_error_state_18(float e[18]) const {
     e[2] = constrain_float(current_state.pos_d - reference_state.pos_d, -MAX_POS_ERR, MAX_POS_ERR);
 
     // Velocity error [3..5]
-    // Clamp to MAX_VEL_ERR to prevent aggressive deceleration commands at high speed.
-    const float MAX_VEL_ERR = 2.0f;  // m/s
+    // Clamp to MAX_VEL_ERR to bound the braking/accel signal.
+    // Set to match MAX_VEL (gym env max velocity command) so LQR sees full error when braking.
+    const float MAX_VEL_ERR = 5.0f;  // m/s (was 2.0 — too small, limited braking at 9 m/s)
     e[3] = constrain_float(current_state.vel_n - reference_state.vel_n, -MAX_VEL_ERR, MAX_VEL_ERR);
     e[4] = constrain_float(current_state.vel_e - reference_state.vel_e, -MAX_VEL_ERR, MAX_VEL_ERR);
     e[5] = constrain_float(current_state.vel_d - reference_state.vel_d, -MAX_VEL_ERR, MAX_VEL_ERR);
@@ -1116,64 +1125,42 @@ void ModeSmartPhoto99::compute_lqi_control() {
         }
     }
 
-    // Asymmetric directional moment limit.
+    // Horizontal moment cap.
     //
-    // A quadcopter can produce any combination of thrust and moment simultaneously.
-    // We exploit this by applying limits asymmetrically based on velocity direction:
+    // Design rationale:
+    //   The previous asymmetric directional limit was buggy for 2D motion:
+    //   when the drone needs to brake in X while accelerating in Y (perpendicular),
+    //   the combined projection onto the velocity direction could appear as "forward
+    //   acceleration" and get blocked incorrectly.
     //
-    //   Accelerating direction (moment component along velocity):
-    //     M_accel_max = K_att * atan(a_budget / g)
-    //     a_budget = MAX_ACCEL * (1 - speed/MAX_SPEED)  → 0 at MAX_SPEED
-    //     → no further forward tilt possible at max speed
+    //   Instead we rely on three mechanisms:
+    //     1. gym env clips vel_cmd magnitude ≤ MAX_VEL_H and zeros it when overspeed
+    //     2. LOOKAHEAD=0 means no persistent position-error-driven forward bias
+    //     3. Simple M_MAX_ABS cap prevents extreme tilt in any direction
     //
-    //   Decelerating direction (moment opposing velocity):
-    //     Unlimited up to M_MAX_ABS — drone can always brake and level itself
+    //   With these:
+    //   - Normal accel: |u[2]| = K[2][3]*1.5 = 0.61 Nm → tilt ≈ 6.8° → 1.2 m/s²
+    //   - Braking from 3 m/s: |u[2]| ≈ 2.0 Nm cap → tilt ≈ 22° → 3.7 m/s²
+    //   - Both within safe recovery range before any FLIP
     //
-    //   Overall cap M_MAX_ABS: prevents backward FLIP during hard braking.
-    //
-    // K_att (pitch attitude gain) converts tilt angle to equilibrium moment:
-    //   K[2][7] = sqrt(Q[7]/R[2]) * Iyy * 15  ≈ 6.87 Nm/rad
-    //
-    // Example (MAX_ACCEL=5, MAX_SPEED=5):
-    //   speed=0   → a_budget=5.0 → theta_max=27° → M_accel=3.23 Nm
-    //   speed=2.5 → a_budget=2.5 → theta_max=14° → M_accel=1.68 Nm
-    //   speed=5.0 → a_budget=0   → M_accel=0     → forward tilt blocked
-    //   braking   → up to M_MAX_ABS freely        → fast leveling
-    const float MAX_HORIZ_ACCEL  = 5.0f;   // m/s²
-    const float MAX_HORIZ_SPEED_M = 5.0f;  // m/s
-    const float M_MAX_ABS        = 4.0f;   // Nm — overall cap (prevents backward FLIP)
-    const float K_ATT            = lqr_gains.K[2][7];  // Nm/rad pitch attitude gain
+    // Hard-braking override: if actual speed > 1.5 * MAX (2.25 m/s), force vel_ref=0.
+    // This handles cases where the companion sends a non-zero vel_ref while overspeed.
+    const float MAX_HORIZ_SPEED_M = 1.5f;  // m/s — matches gym env MAX_VEL
+    const float M_MAX_ABS        = 0.5f;   // Nm — moderate cap; with correct pitch sign, 5.6° max tilt
     {
-        float hs_lqr = sqrtf(current_state.vel_n * current_state.vel_n +
-                              current_state.vel_e * current_state.vel_e);
-        float accel_budget = MAX_HORIZ_ACCEL *
-                             constrain_float(1.0f - hs_lqr / MAX_HORIZ_SPEED_M, 0.0f, 1.0f);
-        float M_accel_max = K_ATT * atanf(accel_budget / GRAVITY_MSS);
-
-        if (hs_lqr > 0.5f) {
-            // Project (u[1], u[2]) onto velocity direction
-            // Positive u[2] → pitches to fly North; positive u[1] → pitches to fly East
-            float vn = current_state.vel_n / hs_lqr;
-            float ve = current_state.vel_e / hs_lqr;
-            float M_fwd = u[2] * vn + u[1] * ve;  // component accelerating in motion direction
-
-            // Limit only the forward-accelerating component
-            if (M_fwd > M_accel_max) {
-                float excess = M_fwd - M_accel_max;
-                u[2] -= excess * vn;
-                u[1] -= excess * ve;
-            }
-        } else {
-            // Near-hover: symmetric proportional cap
-            float M_horiz = sqrtf(u[1]*u[1] + u[2]*u[2]);
-            if (M_horiz > M_accel_max && M_horiz > 0.0f) {
-                float scale = M_accel_max / M_horiz;
-                u[1] *= scale;
-                u[2] *= scale;
-            }
+        float hs_act = sqrtf(current_state.vel_n * current_state.vel_n +
+                             current_state.vel_e * current_state.vel_e);
+        if (hs_act > MAX_HORIZ_SPEED_M * 1.5f) {
+            // Override vel_ref → 0: force the LQR to brake from actual velocity.
+            // The LQR already computed u with reference_state.vel_n/e in the error.
+            // To change vel_ref from ref_vel to 0, adjust by:
+            //   u[i] += -K[i][j] * reference_state.vel_n  (un-apply ref contribution)
+            // K[2][3] = -0.40499, K[1][4] = 0.35328 (from lqr_gains.txt)
+            u[2] -= lqr_gains.K[2][3] * reference_state.vel_n;  // +0.405 * vel_n = braking
+            u[1] -= lqr_gains.K[1][4] * reference_state.vel_e;  // -0.353 * vel_e = braking
         }
 
-        // Overall absolute cap: prevents backward FLIP during hard braking
+        // Overall absolute cap: prevents extreme tilt in any direction
         float M_horiz = sqrtf(u[1]*u[1] + u[2]*u[2]);
         if (M_horiz > M_MAX_ABS) {
             float scale = M_MAX_ABS / M_horiz;
@@ -1184,30 +1171,28 @@ void ModeSmartPhoto99::compute_lqi_control() {
     u[0] = constrain_float(u[0], hover_thrust_N * 0.3f, hover_thrust_N * 1.7f);
     u[3] = constrain_float(u[3], -20.0f, 20.0f);
 
-    // Motor mixing: F,M → individual motor thrusts (N)
-    float motor_thrust[4];
-    mix_motors_from_lqr(u[0], u[1], u[2], u[3], motor_thrust);
-
     // =========================================================================
-    // MOTOR OUTPUT FIX: normalize to [0,1] then reverse-mix to AP_Motors API
+    // MOTOR OUTPUT: direct + frame computation (SITL uses --model +)
     // =========================================================================
-    // Scale max_thrust so that hover maps to MOT_THST_HOVER (0.5).
-    // LQR computes hover thrust = mass*g. Without scaling, throttle_norm at hover
-    // would be mass*g/(4*max_thrust) = 0.613, but AP_Motors expects 0.5 for hover.
-    // Correction: scale max_thrust so that hover_thrust/(4*max_t_scaled) = throttle_hover.
+    // Previous X-frame reverse-mix underestimated pitch/roll by 4x for + frame:
+    //   X-frame: all 4 motors contribute → pitch_out = u[2]/(4*arm*max_t_scaled)
+    //   + frame: only 2 motors contribute → pitch_out = u[2]/(arm*max_t_scaled)
+    //
+    // Direct formula: torque = cmd * max_t_scaled * arm → cmd = torque/(max_t_scaled*arm)
+    //
+    // AP_Motors sign convention: set_pitch(+) = nose DOWN, set_roll(+) = roll right.
+    // LQR: M_pitch > 0 = nose UP (braking), M_roll > 0 = roll right.
+    // → pitch_out needs sign flip; roll_out and yaw_out are same sign.
     float throttle_hover = sysid_data.throttle_hover > 0.0f ? sysid_data.throttle_hover : 0.5f;
-    float max_t_scaled = hover_thrust_N / (4.0f * throttle_hover);  // = mass*g / (4*0.5) = mass*g/2
-    float t0 = constrain_float(motor_thrust[0] / max_t_scaled, 0.0f, 1.0f);
-    float t1 = constrain_float(motor_thrust[1] / max_t_scaled, 0.0f, 1.0f);
-    float t2 = constrain_float(motor_thrust[2] / max_t_scaled, 0.0f, 1.0f);
-    float t3 = constrain_float(motor_thrust[3] / max_t_scaled, 0.0f, 1.0f);
+    float max_t_scaled   = hover_thrust_N / (4.0f * throttle_hover);
+    const float L_arm    = sysid_data.arm_length > 0.0f ? sysid_data.arm_length : 0.225f;
+    const float kM_c     = sysid_data.moment_coefficient > 0.0f ? sysid_data.moment_coefficient : 0.016f;
+    float max_M_arm      = 2.0f * max_t_scaled * L_arm;  // 2 motors contribute torque in + frame
 
-    // Reverse-mix to roll/pitch/yaw/throttle for AP_Motors (X-config)
-    // FL=t0, FR=t1, RL=t2, RR=t3
-    float throttle_norm = (t0 + t1 + t2 + t3) * 0.25f;
-    float roll_out  = (-t0 + t1 - t2 + t3) * 0.25f;   // [-1, 1]
-    float pitch_out = (-t0 - t1 + t2 + t3) * 0.25f;   // [-1, 1]
-    float yaw_out   = ( t0 - t1 - t2 + t3) * 0.25f;   // [-1, 1]
+    float throttle_norm = constrain_float( u[0] / (4.0f * max_t_scaled),      0.0f, 1.0f);
+    float roll_out      = constrain_float( u[1] / max_M_arm,                  -1.0f, 1.0f);
+    float pitch_out     = constrain_float(-u[2] / max_M_arm,                  -1.0f, 1.0f);
+    float yaw_out       = constrain_float( u[3] / (4.0f * kM_c * max_t_scaled), -1.0f, 1.0f);
 
     motors->set_roll(roll_out);
     motors->set_pitch(pitch_out);
@@ -1224,10 +1209,10 @@ void ModeSmartPhoto99::compute_lqi_control() {
         gcs().send_named_float("LQI_M_roll", u[1]);
         gcs().send_named_float("LQI_M_pitch", u[2]);
         gcs().send_named_float("LQI_M_yaw", u[3]);
-        gcs().send_named_float("MTR0", t0);
-        gcs().send_named_float("MTR1", t1);
-        gcs().send_named_float("MTR2", t2);
-        gcs().send_named_float("MTR3", t3);
+        gcs().send_named_float("OUT_thr", throttle_norm);
+        gcs().send_named_float("OUT_roll", roll_out);
+        gcs().send_named_float("OUT_ptch", pitch_out);
+        gcs().send_named_float("OUT_yaw", yaw_out);
         gcs().send_named_float("EKF_q0", current_state.q0);
         gcs().send_named_float("EKF_q1", current_state.q1);
         gcs().send_named_float("EKF_q2", current_state.q2);
@@ -1252,12 +1237,17 @@ void ModeSmartPhoto99::compute_lqi_control() {
     static uint32_t last_debug_ms = 0;
     if (now_ms - last_debug_ms >= 1000) {
         last_debug_ms = now_ms;
+        // Key diagnostics: velocity, moment, pitch_out, tilt
+        float tilt_rad = acosf(constrain_float(
+            1.0f - 2.0f*(current_state.q1*current_state.q1 + current_state.q2*current_state.q2),
+            -1.0f, 1.0f));
         gcs().send_text(MAV_SEVERITY_INFO,
-            "M99 ref=%.2f cur=%.2f thr=%.3f int=%.2f",
-            (double)reference_state.pos_d,
-            (double)current_state.pos_d,
-            (double)throttle_norm,
-            (double)lqi_state.int_pos_d);
+            "M99 vN=%.1f vE=%.1f M2=%.3f ptch=%.3f tilt=%.1f",
+            (double)current_state.vel_n,
+            (double)current_state.vel_e,
+            (double)u[2],
+            (double)pitch_out,
+            (double)(tilt_rad * 57.3f));
     }
 }
 
