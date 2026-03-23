@@ -264,20 +264,8 @@ void ModeSmartPhoto99::run() {
             reference_state.vel_d = 0.0f;
         }
 
-        // Speed governor: blend vel_ref toward current_vel as speed approaches MAX_HORIZ_SPEED.
-        // alpha = speed / MAX_HORIZ_SPEED (clamped to 1.0)
-        //   alpha=0: vel_ref unchanged (full LQR authority)
-        //   alpha=1: vel_ref = current_vel → vel_error = 0 → zero net acceleration
-        // This tapers acceleration to zero at the speed limit, and for speeds above the
-        // limit the excess creates a proportional braking error (same as before).
-        const float MAX_HORIZ_SPEED = 5.0f;  // m/s
-        float hs = sqrtf(current_state.vel_n * current_state.vel_n +
-                          current_state.vel_e * current_state.vel_e);
-        {
-            float alpha = constrain_float(hs / MAX_HORIZ_SPEED, 0.0f, 1.0f);
-            reference_state.vel_n = (1.0f - alpha) * reference_state.vel_n + alpha * current_state.vel_n;
-            reference_state.vel_e = (1.0f - alpha) * reference_state.vel_e + alpha * current_state.vel_e;
-        }
+        // vel_ref is used as-is from companion. Speed limiting is handled in the
+        // LQR output stage via asymmetric directional moment clamping (see run_lqr_control).
 
         // Reference attitude: level flight at commanded yaw
         Quaternion q_ref;
@@ -1017,30 +1005,6 @@ void ModeSmartPhoto99::get_error_state_18(float e[18]) const {
     e[1] = constrain_float(current_state.pos_e - reference_state.pos_e, -MAX_POS_ERR, MAX_POS_ERR);
     e[2] = constrain_float(current_state.pos_d - reference_state.pos_d, -MAX_POS_ERR, MAX_POS_ERR);
 
-    // Speed-based forward acceleration suppressor.
-    // At high speed, LQR position error can still command forward tilt even when
-    // vel_error = 0 (e.g. target is ahead of the drone).  Suppress the position
-    // error component in the direction of motion proportional to speed / MAX_SPEED.
-    //   alpha=0 (low speed)  → pos_error unchanged (normal LQR)
-    //   alpha=1 (MAX_SPEED)  → forward pos_error zeroed (no acceleration)
-    // Backward pos_error (deceleration) is left untouched so braking still works.
-    const float MAX_HORIZ_SPEED_PE = 5.0f;  // m/s — matches vel_ref governor above
-    float hs_pe = sqrtf(current_state.vel_n * current_state.vel_n +
-                         current_state.vel_e * current_state.vel_e);
-    if (hs_pe > 0.1f) {
-        float alpha_pe = constrain_float(hs_pe / MAX_HORIZ_SPEED_PE, 0.0f, 1.0f);
-        float vel_unit_n = current_state.vel_n / hs_pe;
-        float vel_unit_e = current_state.vel_e / hs_pe;
-        // Project pos_error onto direction of motion (negative = target ahead = accelerating)
-        float fwd_component = e[0] * vel_unit_n + e[1] * vel_unit_e;
-        if (fwd_component < 0.0f) {
-            // Target is ahead — suppress this accelerating component
-            e[0] -= vel_unit_n * fwd_component * alpha_pe;
-            e[1] -= vel_unit_e * fwd_component * alpha_pe;
-        }
-        // fwd_component > 0 means target is behind (deceleration) — leave untouched
-    }
-
     // Velocity error [3..5]
     // Clamp to MAX_VEL_ERR to prevent aggressive deceleration commands at high speed.
     const float MAX_VEL_ERR = 2.0f;  // m/s
@@ -1152,32 +1116,70 @@ void ModeSmartPhoto99::compute_lqi_control() {
         }
     }
 
-    // Speed-dependent horizontal moment limit.
-    // Derivation: max horizontal force = mass * a_budget
-    //             moment_limit = mass * arm_length * a_budget
-    // a_budget decreases linearly with speed → zero at MAX_HORIZ_SPEED.
-    // This means the drone physically cannot accelerate further at max speed,
-    // and has full maneuverability at low speed.
+    // Asymmetric directional moment limit.
     //
-    // Example (mass=2.0, arm=0.225, a_max=5 m/s²):
-    //   speed=0   m/s → a_budget=5.0 → M_limit=2.25 Nm (~30° tilt)
-    //   speed=2.5 m/s → a_budget=2.5 → M_limit=1.13 Nm (~15° tilt)
-    //   speed=5.0 m/s → a_budget=0   → M_limit=MIN_STAB  (level flight)
+    // A quadcopter can produce any combination of thrust and moment simultaneously.
+    // We exploit this by applying limits asymmetrically based on velocity direction:
     //
-    // MIN_MOMENT_STAB: floor to retain attitude stabilization authority.
-    // Without it, M_limit=0 at max speed → drone can't level itself → stays tilted.
-    const float MAX_HORIZ_ACCEL = 5.0f;   // m/s² — design parameter
-    const float MIN_MOMENT_STAB = 0.3f;   // Nm  — minimum for attitude stabilization
+    //   Accelerating direction (moment component along velocity):
+    //     M_accel_max = K_att * atan(a_budget / g)
+    //     a_budget = MAX_ACCEL * (1 - speed/MAX_SPEED)  → 0 at MAX_SPEED
+    //     → no further forward tilt possible at max speed
+    //
+    //   Decelerating direction (moment opposing velocity):
+    //     Unlimited up to M_MAX_ABS — drone can always brake and level itself
+    //
+    //   Overall cap M_MAX_ABS: prevents backward FLIP during hard braking.
+    //
+    // K_att (pitch attitude gain) converts tilt angle to equilibrium moment:
+    //   K[2][7] = sqrt(Q[7]/R[2]) * Iyy * 15  ≈ 6.87 Nm/rad
+    //
+    // Example (MAX_ACCEL=5, MAX_SPEED=5):
+    //   speed=0   → a_budget=5.0 → theta_max=27° → M_accel=3.23 Nm
+    //   speed=2.5 → a_budget=2.5 → theta_max=14° → M_accel=1.68 Nm
+    //   speed=5.0 → a_budget=0   → M_accel=0     → forward tilt blocked
+    //   braking   → up to M_MAX_ABS freely        → fast leveling
+    const float MAX_HORIZ_ACCEL  = 5.0f;   // m/s²
+    const float MAX_HORIZ_SPEED_M = 5.0f;  // m/s
+    const float M_MAX_ABS        = 4.0f;   // Nm — overall cap (prevents backward FLIP)
+    const float K_ATT            = lqr_gains.K[2][7];  // Nm/rad pitch attitude gain
     {
         float hs_lqr = sqrtf(current_state.vel_n * current_state.vel_n +
                               current_state.vel_e * current_state.vel_e);
-        const float MAX_HORIZ_SPEED_LQR = 5.0f;  // m/s — unified with vel_ref governor
         float accel_budget = MAX_HORIZ_ACCEL *
-                             constrain_float(1.0f - hs_lqr / MAX_HORIZ_SPEED_LQR, 0.0f, 1.0f);
-        float moment_limit = MAX(sysid_data.mass * sysid_data.arm_length * accel_budget,
-                                 MIN_MOMENT_STAB);
-        u[1] = constrain_float(u[1], -moment_limit, moment_limit);
-        u[2] = constrain_float(u[2], -moment_limit, moment_limit);
+                             constrain_float(1.0f - hs_lqr / MAX_HORIZ_SPEED_M, 0.0f, 1.0f);
+        float M_accel_max = K_ATT * atanf(accel_budget / GRAVITY_MSS);
+
+        if (hs_lqr > 0.5f) {
+            // Project (u[1], u[2]) onto velocity direction
+            // Positive u[2] → pitches to fly North; positive u[1] → pitches to fly East
+            float vn = current_state.vel_n / hs_lqr;
+            float ve = current_state.vel_e / hs_lqr;
+            float M_fwd = u[2] * vn + u[1] * ve;  // component accelerating in motion direction
+
+            // Limit only the forward-accelerating component
+            if (M_fwd > M_accel_max) {
+                float excess = M_fwd - M_accel_max;
+                u[2] -= excess * vn;
+                u[1] -= excess * ve;
+            }
+        } else {
+            // Near-hover: symmetric proportional cap
+            float M_horiz = sqrtf(u[1]*u[1] + u[2]*u[2]);
+            if (M_horiz > M_accel_max && M_horiz > 0.0f) {
+                float scale = M_accel_max / M_horiz;
+                u[1] *= scale;
+                u[2] *= scale;
+            }
+        }
+
+        // Overall absolute cap: prevents backward FLIP during hard braking
+        float M_horiz = sqrtf(u[1]*u[1] + u[2]*u[2]);
+        if (M_horiz > M_MAX_ABS) {
+            float scale = M_MAX_ABS / M_horiz;
+            u[1] *= scale;
+            u[2] *= scale;
+        }
     }
     u[0] = constrain_float(u[0], hover_thrust_N * 0.3f, hover_thrust_N * 1.7f);
     u[3] = constrain_float(u[3], -20.0f, 20.0f);
