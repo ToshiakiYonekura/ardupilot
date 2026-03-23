@@ -1158,8 +1158,8 @@ void ModeSmartPhoto99::compute_lqi_control() {
     // producing LQR equilibrium tilt of ~92° with 2m pos error + 2m/s vel error.
     // Calculation: K_att * 0.52rad(30°) = 1.13 Nm → limit horiz moments to ±1.1 Nm.
     u[0] = constrain_float(u[0], hover_thrust_N * 0.3f, hover_thrust_N * 1.7f);
-    u[1] = constrain_float(u[1], -50.0f, 50.0f);
-    u[2] = constrain_float(u[2], -50.0f, 50.0f);
+    u[1] = constrain_float(u[1], -1.1f, 1.1f);
+    u[2] = constrain_float(u[2], -1.1f, 1.1f);
     u[3] = constrain_float(u[3], -20.0f, 20.0f);
 
     // Motor mixing: F,M → individual motor thrusts (N)
