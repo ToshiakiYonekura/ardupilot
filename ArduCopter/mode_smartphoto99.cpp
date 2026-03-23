@@ -1152,14 +1152,34 @@ void ModeSmartPhoto99::compute_lqi_control() {
         }
     }
 
-    // Clamp
-    // MAX_MOMENT_HORIZ: limits commanded roll/pitch to ~30° tilt.
-    // Without this, position+velocity gains (Q=0.05) overpower attitude gains (Q=10),
-    // producing LQR equilibrium tilt of ~92° with 2m pos error + 2m/s vel error.
-    // Calculation: K_att * 0.52rad(30°) = 1.13 Nm → limit horiz moments to ±1.1 Nm.
+    // Speed-dependent horizontal moment limit.
+    // Derivation: max horizontal force = mass * a_budget
+    //             moment_limit = mass * arm_length * a_budget
+    // a_budget decreases linearly with speed → zero at MAX_HORIZ_SPEED.
+    // This means the drone physically cannot accelerate further at max speed,
+    // and has full maneuverability at low speed.
+    //
+    // Example (mass=2.0, arm=0.225, a_max=5 m/s²):
+    //   speed=0   m/s → a_budget=5.0 → M_limit=2.25 Nm (~30° tilt)
+    //   speed=2.5 m/s → a_budget=2.5 → M_limit=1.13 Nm (~15° tilt)
+    //   speed=5.0 m/s → a_budget=0   → M_limit=MIN_STAB  (level flight)
+    //
+    // MIN_MOMENT_STAB: floor to retain attitude stabilization authority.
+    // Without it, M_limit=0 at max speed → drone can't level itself → stays tilted.
+    const float MAX_HORIZ_ACCEL = 5.0f;   // m/s² — design parameter
+    const float MIN_MOMENT_STAB = 0.3f;   // Nm  — minimum for attitude stabilization
+    {
+        float hs_lqr = sqrtf(current_state.vel_n * current_state.vel_n +
+                              current_state.vel_e * current_state.vel_e);
+        const float MAX_HORIZ_SPEED_LQR = 5.0f;  // m/s — unified with vel_ref governor
+        float accel_budget = MAX_HORIZ_ACCEL *
+                             constrain_float(1.0f - hs_lqr / MAX_HORIZ_SPEED_LQR, 0.0f, 1.0f);
+        float moment_limit = MAX(sysid_data.mass * sysid_data.arm_length * accel_budget,
+                                 MIN_MOMENT_STAB);
+        u[1] = constrain_float(u[1], -moment_limit, moment_limit);
+        u[2] = constrain_float(u[2], -moment_limit, moment_limit);
+    }
     u[0] = constrain_float(u[0], hover_thrust_N * 0.3f, hover_thrust_N * 1.7f);
-    u[1] = constrain_float(u[1], -1.1f, 1.1f);
-    u[2] = constrain_float(u[2], -1.1f, 1.1f);
     u[3] = constrain_float(u[3], -20.0f, 20.0f);
 
     // Motor mixing: F,M → individual motor thrusts (N)
