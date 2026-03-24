@@ -253,19 +253,33 @@ void ModeSmartPhoto99::run() {
         reference_state.pos_e = target_position_ne.y;
         reference_state.pos_d = target_altitude;
 
-        // Reference velocity from companion (or zero for pilot)
+        // Reference velocity from companion — with rate-limiting to prevent sudden reversals.
+        //
+        // Problem: companion sends e.g. vel_ref_N = -1.5 m/s while drone is moving at +2 m/s N.
+        //   → velocity error jumps to 3.5 m/s → LQR applies max moment → 40°+ tilt → FLIP
+        //
+        // Fix: rate-limit vel_ref change to MAX_VEL_REF_RATE per LQR cycle (10ms).
+        //   MAX_VEL_REF_RATE = 0.15 m/s per 10ms = 15 m/s² max reference acceleration
+        //   → change from 0 to 1.5 m/s in: 1.5/0.15 = 10 cycles = 100ms (smooth)
+        //   → change from +1.5 to -1.5 m/s in: 3.0/0.15 = 20 cycles = 200ms (gentle reversal)
+        const float MAX_VEL_REF_RATE = 0.15f;  // m/s per 10ms LQR cycle
+        float target_vel_n = 0.0f;
+        float target_vel_e = 0.0f;
+        float target_vel_d = 0.0f;
         if (smoothing.use_companion_cmd && companion_command_valid()) {
-            reference_state.vel_n = companion_cmd.velocity_ned.x;
-            reference_state.vel_e = companion_cmd.velocity_ned.y;
-            reference_state.vel_d = companion_cmd.velocity_ned.z;
-        } else {
-            reference_state.vel_n = 0.0f;
-            reference_state.vel_e = 0.0f;
-            reference_state.vel_d = 0.0f;
+            target_vel_n = companion_cmd.velocity_ned.x;
+            target_vel_e = companion_cmd.velocity_ned.y;
+            target_vel_d = companion_cmd.velocity_ned.z;
         }
-
-        // vel_ref is used as-is from companion. Speed limiting is handled in the
-        // LQR output stage via asymmetric directional moment clamping (see run_lqr_control).
+        reference_state.vel_n = constrain_float(target_vel_n,
+            reference_state.vel_n - MAX_VEL_REF_RATE,
+            reference_state.vel_n + MAX_VEL_REF_RATE);
+        reference_state.vel_e = constrain_float(target_vel_e,
+            reference_state.vel_e - MAX_VEL_REF_RATE,
+            reference_state.vel_e + MAX_VEL_REF_RATE);
+        reference_state.vel_d = constrain_float(target_vel_d,
+            reference_state.vel_d - MAX_VEL_REF_RATE,
+            reference_state.vel_d + MAX_VEL_REF_RATE);
 
         // Reference attitude: level flight at commanded yaw
         Quaternion q_ref;
@@ -1145,8 +1159,8 @@ void ModeSmartPhoto99::compute_lqi_control() {
     //
     // Hard-braking override: if actual speed > 1.5 * MAX (2.25 m/s), force vel_ref=0.
     // This handles cases where the companion sends a non-zero vel_ref while overspeed.
-    const float MAX_HORIZ_SPEED_M = 1.5f;  // m/s — matches gym env MAX_VEL
-    const float M_MAX_ABS        = 0.5f;   // Nm — moderate cap; with correct pitch sign, 5.6° max tilt
+    const float MAX_HORIZ_SPEED_M = 1.5f;  // m/s — matches gym env MAX_VEL (goal-relative action space)
+    const float M_MAX_ABS        = 2.0f;   // Nm — allows up to ~22° tilt for braking; sufficient restoring at 36°
     {
         float hs_act = sqrtf(current_state.vel_n * current_state.vel_n +
                              current_state.vel_e * current_state.vel_e);
