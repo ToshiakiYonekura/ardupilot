@@ -259,10 +259,11 @@ void ModeSmartPhoto99::run() {
         //   → velocity error jumps to 3.5 m/s → LQR applies max moment → 40°+ tilt → FLIP
         //
         // Fix: rate-limit vel_ref change to MAX_VEL_REF_RATE per LQR cycle (10ms).
-        //   MAX_VEL_REF_RATE = 0.15 m/s per 10ms = 15 m/s² max reference acceleration
-        //   → change from 0 to 1.5 m/s in: 1.5/0.15 = 10 cycles = 100ms (smooth)
-        //   → change from +1.5 to -1.5 m/s in: 3.0/0.15 = 20 cycles = 200ms (gentle reversal)
-        const float MAX_VEL_REF_RATE = 0.15f;  // m/s per 10ms LQR cycle
+        //   MAX_VEL_REF_RATE = 0.30 m/s per 10ms = 30 m/s² max reference acceleration
+        //   → change from 0 to 2.0 m/s in: 2.0/0.30 = 7 cycles = 70ms (smooth)
+        //   → change from +2.0 to -2.0 m/s in: 4.0/0.30 = 14 cycles = 140ms (gentle reversal)
+        //   Increased from 0.15 after TILT=0 confirmed with mass-unified SITL (gym MAX_VEL=2.0)
+        const float MAX_VEL_REF_RATE = 0.30f;  // m/s per 10ms LQR cycle
         float target_vel_n = 0.0f;
         float target_vel_e = 0.0f;
         float target_vel_d = 0.0f;
@@ -1159,7 +1160,7 @@ void ModeSmartPhoto99::compute_lqi_control() {
     //
     // Hard-braking override: if actual speed > 1.5 * MAX (2.25 m/s), force vel_ref=0.
     // This handles cases where the companion sends a non-zero vel_ref while overspeed.
-    const float MAX_HORIZ_SPEED_M = 1.5f;  // m/s — matches gym env MAX_VEL (goal-relative action space)
+    const float MAX_HORIZ_SPEED_M = 2.0f;  // m/s — matches gym env MAX_VEL=2.0 (increased from 1.5 after TILT=0 confirmed)
     const float M_MAX_ABS        = 2.0f;   // Nm — allows up to ~22° tilt for braking; sufficient restoring at 36°
     {
         float hs_act = sqrtf(current_state.vel_n * current_state.vel_n +
