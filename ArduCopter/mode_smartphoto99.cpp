@@ -137,6 +137,13 @@ bool ModeSmartPhoto99::init(bool ignore_checks) {
     // Reset integrals
     memset(&lqi_state, 0, sizeof(LQIState));
 
+    // Reset LQR output storage (no valid output until first compute_lqi_control)
+    lqr_roll_out      = 0.0f;
+    lqr_pitch_out     = 0.0f;
+    lqr_yaw_out       = 0.0f;
+    lqr_throttle_norm = sysid_data.throttle_hover > 0.0f ? sysid_data.throttle_hover : 0.5f;
+    lqr_output_valid  = false;
+
     // Timing
     uint32_t now_ms = AP_HAL::millis();
     last_state_feedback_ms = now_ms;
@@ -259,11 +266,12 @@ void ModeSmartPhoto99::run() {
         //   → velocity error jumps to 3.5 m/s → LQR applies max moment → 40°+ tilt → FLIP
         //
         // Fix: rate-limit vel_ref change to MAX_VEL_REF_RATE per LQR cycle (10ms).
-        //   MAX_VEL_REF_RATE = 0.30 m/s per 10ms = 30 m/s² max reference acceleration
-        //   → change from 0 to 2.0 m/s in: 2.0/0.30 = 7 cycles = 70ms (smooth)
-        //   → change from +2.0 to -2.0 m/s in: 4.0/0.30 = 14 cycles = 140ms (gentle reversal)
-        //   Increased from 0.15 after TILT=0 confirmed with mass-unified SITL (gym MAX_VEL=2.0)
-        const float MAX_VEL_REF_RATE = 0.30f;  // m/s per 10ms LQR cycle
+        //   MAX_VEL_REF_RATE = 1.0 m/s per 10ms = 100 m/s² max reference acceleration
+        //   → change from 0 to 4.0 m/s in: 4.0/1.0 = 4 cycles = 40ms SIM (fast tracking)
+        //   → change from +4.0 to -4.0 m/s in: 8.0/1.0 = 8 cycles = 80ms SIM (safe reversal)
+        //   Increased from 0.30 (gym MAX_VEL=2.0, TILT=0) → 1.0 (gym MAX_VEL=4.0, TILT=0 confirmed)
+        //   At 1.0/cycle reversal takes 80ms SIM → tilt < 10° with 2kg/Ixx=0.035 drone
+        const float MAX_VEL_REF_RATE = 1.0f;  // m/s per 10ms LQR cycle
         float target_vel_n = 0.0f;
         float target_vel_e = 0.0f;
         float target_vel_d = 0.0f;
@@ -371,6 +379,30 @@ void ModeSmartPhoto99::use_attitude_controller_fallback() {
         attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_rad(0.0f, 0.0f, 0.0f);
         attitude_control->set_throttle_out(0.5f, true, g.throttle_filt);
     }
+}
+
+// ============================================================================
+// OUTPUT_TO_MOTORS — reapply LQR commands just before motors->output()
+//
+// Called by motors_output_main() in Copter.cpp.  The scheduler runs:
+//   run_rate_controller_main()  →  attitude_control->rate_controller_run()
+//                                  which calls motors->set_pitch(~0) to hold level
+//   motors_output_main()        →  flightmode->output_to_motors() → motors->output()
+//   update_flight_mode()        →  Mode 99 compute_lqi_control() (runs LAST)
+//
+// Without this override the attitude rate controller always overwrites our LQR
+// pitch/roll commands, keeping the drone level regardless of the velocity command.
+// ============================================================================
+void ModeSmartPhoto99::output_to_motors()
+{
+    if (lqr_output_valid && lqr_gains.valid && sysid_data.mass > 0.0f) {
+        motors->set_roll(lqr_roll_out);
+        motors->set_pitch(lqr_pitch_out);
+        motors->set_yaw(lqr_yaw_out);
+        motors->set_throttle(lqr_throttle_norm);
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+    }
+    motors->output();
 }
 
 // ============================================================================
@@ -1158,9 +1190,9 @@ void ModeSmartPhoto99::compute_lqi_control() {
     //   - Braking from 3 m/s: |u[2]| ≈ 2.0 Nm cap → tilt ≈ 22° → 3.7 m/s²
     //   - Both within safe recovery range before any FLIP
     //
-    // Hard-braking override: if actual speed > 1.5 * MAX (2.25 m/s), force vel_ref=0.
+    // Hard-braking override: if actual speed > 1.5 * MAX (6.0 m/s), force vel_ref=0.
     // This handles cases where the companion sends a non-zero vel_ref while overspeed.
-    const float MAX_HORIZ_SPEED_M = 2.0f;  // m/s — matches gym env MAX_VEL=2.0 (increased from 1.5 after TILT=0 confirmed)
+    const float MAX_HORIZ_SPEED_M = 4.0f;  // m/s — matches gym env MAX_VEL=4.0 (updated from 2.0)
     const float M_MAX_ABS        = 2.0f;   // Nm — allows up to ~22° tilt for braking; sufficient restoring at 36°
     {
         float hs_act = sqrtf(current_state.vel_n * current_state.vel_n +
@@ -1195,9 +1227,9 @@ void ModeSmartPhoto99::compute_lqi_control() {
     //
     // Direct formula: torque = cmd * max_t_scaled * arm → cmd = torque/(max_t_scaled*arm)
     //
-    // AP_Motors sign convention: set_pitch(+) = nose DOWN, set_roll(+) = roll right.
+    // AP_Motors sign convention: set_pitch(+) = nose UP, set_roll(+) = roll right.
     // LQR: M_pitch > 0 = nose UP (braking), M_roll > 0 = roll right.
-    // → pitch_out needs sign flip; roll_out and yaw_out are same sign.
+    // → pitch_out same sign as u[2]; no sign flip needed.
     float throttle_hover = sysid_data.throttle_hover > 0.0f ? sysid_data.throttle_hover : 0.5f;
     float max_t_scaled   = hover_thrust_N / (4.0f * throttle_hover);
     const float L_arm    = sysid_data.arm_length > 0.0f ? sysid_data.arm_length : 0.225f;
@@ -1206,14 +1238,24 @@ void ModeSmartPhoto99::compute_lqi_control() {
 
     float throttle_norm = constrain_float( u[0] / (4.0f * max_t_scaled),      0.0f, 1.0f);
     float roll_out      = constrain_float( u[1] / max_M_arm,                  -1.0f, 1.0f);
-    float pitch_out     = constrain_float(-u[2] / max_M_arm,                  -1.0f, 1.0f);
+    float pitch_out     = constrain_float( u[2] / max_M_arm,                  -1.0f, 1.0f);
     float yaw_out       = constrain_float( u[3] / (4.0f * kM_c * max_t_scaled), -1.0f, 1.0f);
+
+    // Store for output_to_motors() — these will be reapplied there because
+    // run_rate_controller_main() (runs BEFORE motors_output_main in the 400Hz
+    // scheduler) calls attitude_control->rate_controller_run() which overwrites
+    // whatever we set here.
+    lqr_roll_out      = roll_out;
+    lqr_pitch_out     = pitch_out;
+    lqr_yaw_out       = yaw_out;
+    lqr_throttle_norm = throttle_norm;
+    lqr_output_valid  = true;
 
     motors->set_roll(roll_out);
     motors->set_pitch(pitch_out);
     motors->set_yaw(yaw_out);
     motors->set_throttle(throttle_norm);
-    // motors->output() is called by the scheduler
+    // Final apply happens in output_to_motors() just before motors->output()
 
     // Telemetry @ 1Hz (rate-limited to avoid buffer overflow at 100Hz)
     const uint32_t now_ms = AP_HAL::millis();
