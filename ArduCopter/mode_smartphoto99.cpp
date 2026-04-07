@@ -271,7 +271,7 @@ void ModeSmartPhoto99::run() {
         //   → change from +4.0 to -4.0 m/s in: 8.0/1.0 = 8 cycles = 80ms SIM (safe reversal)
         //   Increased from 0.30 (gym MAX_VEL=2.0, TILT=0) → 1.0 (gym MAX_VEL=4.0, TILT=0 confirmed)
         //   At 1.0/cycle reversal takes 80ms SIM → tilt < 10° with 2kg/Ixx=0.035 drone
-        const float MAX_VEL_REF_RATE = 1.0f;  // m/s per 10ms LQR cycle
+        const float MAX_VEL_REF_RATE = 0.3f;  // m/s per 10ms LQR cycle
         float target_vel_n = 0.0f;
         float target_vel_e = 0.0f;
         float target_vel_d = 0.0f;
@@ -280,15 +280,29 @@ void ModeSmartPhoto99::run() {
             target_vel_e = companion_cmd.velocity_ned.y;
             target_vel_d = companion_cmd.velocity_ned.z;
         }
-        reference_state.vel_n = constrain_float(target_vel_n,
+        // Step 1: rate-limit (hard clip on max change per cycle)
+        float rate_limited_n = constrain_float(target_vel_n,
             reference_state.vel_n - MAX_VEL_REF_RATE,
             reference_state.vel_n + MAX_VEL_REF_RATE);
-        reference_state.vel_e = constrain_float(target_vel_e,
+        float rate_limited_e = constrain_float(target_vel_e,
             reference_state.vel_e - MAX_VEL_REF_RATE,
             reference_state.vel_e + MAX_VEL_REF_RATE);
-        reference_state.vel_d = constrain_float(target_vel_d,
+        float rate_limited_d = constrain_float(target_vel_d,
             reference_state.vel_d - MAX_VEL_REF_RATE,
             reference_state.vel_d + MAX_VEL_REF_RATE);
+
+        // Step 2: low-pass filter on reversal only
+        // When target flips sign vs current ref, apply exponential smoothing (α=0.3).
+        // Normal acceleration (same direction) passes through without smoothing.
+        const float LP_ALPHA = 0.3f;
+        auto apply_lp = [&](float rate_lim, float current, float target) -> float {
+            bool reversing = (target * current < 0.0f);
+            return reversing ? LP_ALPHA * rate_lim + (1.0f - LP_ALPHA) * current
+                             : rate_lim;
+        };
+        reference_state.vel_n = apply_lp(rate_limited_n, reference_state.vel_n, target_vel_n);
+        reference_state.vel_e = apply_lp(rate_limited_e, reference_state.vel_e, target_vel_e);
+        reference_state.vel_d = apply_lp(rate_limited_d, reference_state.vel_d, target_vel_d);
 
         // Reference attitude: level flight at commanded yaw
         Quaternion q_ref;
@@ -1264,7 +1278,7 @@ void ModeSmartPhoto99::compute_lqi_control() {
         last_named_float_ms = now_ms;
         gcs().send_named_float("LQI_Thrust", u[0]);
         gcs().send_named_float("LQI_M_roll", u[1]);
-        gcs().send_named_float("LQI_M_pitch", u[2]);
+        gcs().send_named_float("LQI_M_ptch", u[2]);
         gcs().send_named_float("LQI_M_yaw", u[3]);
         gcs().send_named_float("OUT_thr", throttle_norm);
         gcs().send_named_float("OUT_roll", roll_out);

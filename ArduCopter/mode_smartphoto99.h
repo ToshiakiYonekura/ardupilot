@@ -32,6 +32,11 @@ public:
     bool allows_arming(AP_Arming::Method method) const override { return true; }
     bool is_autopilot() const override { return true; }
 
+    // Override output_to_motors() to reapply LQR values AFTER the attitude
+    // rate controller (run_rate_controller_main) has overwritten them.
+    // Called by motors_output_main() just before motors->output().
+    void output_to_motors() override;
+
     // Companion computer interface (public for MAVLink access)
     // Units: pos_ned [meters], vel_ned [m/s], yaw_target [radians], yaw_rate_target [rad/s]
     void update_companion_command(const Vector3f& pos_ned, const Vector3f& vel_ned,
@@ -144,6 +149,15 @@ private:
     struct SmoothingParams {
         bool use_companion_cmd;
     } smoothing;
+
+    // LQR output storage — written by compute_lqi_control(), read by output_to_motors().
+    // Needed because run_rate_controller_main() (400Hz) overwrites motors->set_pitch() etc.
+    // before motors->output() is called, erasing Mode 99's commands.
+    float lqr_roll_out      = 0.0f;
+    float lqr_pitch_out     = 0.0f;
+    float lqr_yaw_out       = 0.0f;
+    float lqr_throttle_norm = 0.5f;
+    bool  lqr_output_valid  = false;
 
     // Timing control
     uint32_t last_state_feedback_ms;

@@ -1,24 +1,18 @@
 # System Identification Parameters for Mode 99 LQR Controller
-# Generated for SITL testing - typical quadcopter values
-#
-# These values represent a medium-sized quadcopter (~2kg)
-# You should replace these with actual system ID results from Mode 98
+# These values match the LQR design (design_lqr_discrete.py) and SITL model (Tools/autotest/models/quad_2kg.json)
 
 # Physical parameters
-MASS=2.0            # Total mass in kg (typical for medium quad)
-IXX=0.015           # Roll inertia in kg·m²
-IYY=0.015           # Pitch inertia in kg·m²
-IZZ=0.025           # Yaw inertia in kg·m²
+MASS=2.0            # Total mass in kg
+IXX=0.0347          # Roll inertia in kg·m²
+IYY=0.0458          # Pitch inertia in kg·m²
+IZZ=0.0977          # Yaw inertia in kg·m²
 
 # Motor parameters
 MOTOR_KV=920.0      # Motor KV rating
 MAX_THRUST=20.0     # Max thrust per motor in Newtons
 
-# Control parameters (from system identification)
+# Control parameters
 ROLL_GAIN=4.5       # Roll rate gain
 PITCH_GAIN=4.5      # Pitch rate gain
 YAW_GAIN=2.5        # Yaw rate gain
 THROTTLE_HOVER=0.5  # Hover throttle (0-1)
-
-# Data collection info
-SAMPLES=1000        # Number of samples collected
