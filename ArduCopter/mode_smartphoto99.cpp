@@ -1255,6 +1255,42 @@ void ModeSmartPhoto99::compute_lqi_control() {
     float pitch_out     = constrain_float( u[2] / max_M_arm,                  -1.0f, 1.0f);
     float yaw_out       = constrain_float( u[3] / (4.0f * kM_c * max_t_scaled), -1.0f, 1.0f);
 
+    // =========================================================================
+    // ATTITUDE-AWARE TILT LIMITING
+    // =========================================================================
+    // M_MAX_ABS caps moment magnitude assuming hover, but when the drone is
+    // already tilted the same moment can push it past the stability limit.
+    // Progressively reduce commands that WORSEN the current tilt as attitude
+    // approaches the hard limit.
+    //
+    // Recovery commands (opposite sign to current attitude) are never scaled —
+    // the drone must always be able to level itself.
+    {
+        const float TILT_SOFT_DEG = 20.0f;  // begin scaling at 20°
+        const float TILT_HARD_DEG = 30.0f;  // zero out worsening commands at 30°
+
+        // Use accurate tilt: arccos(cos_roll * cos_pitch)
+        float tilt_deg = degrees(acosf(constrain_float(
+            ahrs.cos_roll() * ahrs.cos_pitch(), 0.0f, 1.0f)));
+
+        if (tilt_deg > TILT_SOFT_DEG) {
+            float scale = constrain_float(
+                1.0f - (tilt_deg - TILT_SOFT_DEG) / (TILT_HARD_DEG - TILT_SOFT_DEG),
+                0.0f, 1.0f);
+
+            // AP_Motors: set_pitch(+) = nose up,  set_roll(+) = roll right.
+            // Command same sign as current attitude → worsens tilt → scale down.
+            float roll_rad  = ahrs.get_roll_rad();   // positive = right roll
+            float pitch_rad = ahrs.get_pitch_rad();  // positive = nose up
+            if (pitch_out * pitch_rad > 0.0f) {
+                pitch_out *= scale;
+            }
+            if (roll_out * roll_rad > 0.0f) {
+                roll_out *= scale;
+            }
+        }
+    }
+
     // Store for output_to_motors() — these will be reapplied there because
     // run_rate_controller_main() (runs BEFORE motors_output_main in the 400Hz
     // scheduler) calls attitude_control->rate_controller_run() which overwrites
