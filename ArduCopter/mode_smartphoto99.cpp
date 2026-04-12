@@ -266,12 +266,14 @@ void ModeSmartPhoto99::run() {
         //   → velocity error jumps to 3.5 m/s → LQR applies max moment → 40°+ tilt → FLIP
         //
         // Fix: rate-limit vel_ref change to MAX_VEL_REF_RATE per LQR cycle (10ms).
-        //   MAX_VEL_REF_RATE = 1.0 m/s per 10ms = 100 m/s² max reference acceleration
-        //   → change from 0 to 4.0 m/s in: 4.0/1.0 = 4 cycles = 40ms SIM (fast tracking)
-        //   → change from +4.0 to -4.0 m/s in: 8.0/1.0 = 8 cycles = 80ms SIM (safe reversal)
-        //   Increased from 0.30 (gym MAX_VEL=2.0, TILT=0) → 1.0 (gym MAX_VEL=4.0, TILT=0 confirmed)
-        //   At 1.0/cycle reversal takes 80ms SIM → tilt < 10° with 2kg/Ixx=0.035 drone
-        const float MAX_VEL_REF_RATE = 0.3f;  // m/s per 10ms LQR cycle
+        //   MAX_VEL_REF_RATE = 0.01 m/s per 10ms = 1 m/s² max reference acceleration
+        //   → matches gym env MAX_VEL_RATE = 0.05 m/s/step (50ms) = 1 m/s²
+        //   → N/E use L2-norm clip (not per-component L∞) to prevent diagonal overshoot:
+        //     L∞ bug: per-axis 0.01 → diagonal √2×0.01×100Hz = 1.41 m/s² → 8° (safe but still biased)
+        //     L2 fix: combined delta clipped to 0.01 → diagonal = 1 m/s² exactly
+        //   → change from 0 to 3.5 m/s in: 3.5/0.01 = 350 cycles = 3.5s (smooth ramp)
+        //   → change from +3.5 to -3.5 m/s in: 7.0/0.01 = 700 cycles = 7.0s (safe reversal)
+        const float MAX_VEL_REF_RATE = 0.01f;  // m/s per 10ms LQR cycle = 1 m/s²
         float target_vel_n = 0.0f;
         float target_vel_e = 0.0f;
         float target_vel_d = 0.0f;
@@ -280,13 +282,18 @@ void ModeSmartPhoto99::run() {
             target_vel_e = companion_cmd.velocity_ned.y;
             target_vel_d = companion_cmd.velocity_ned.z;
         }
-        // Step 1: rate-limit (hard clip on max change per cycle)
-        float rate_limited_n = constrain_float(target_vel_n,
-            reference_state.vel_n - MAX_VEL_REF_RATE,
-            reference_state.vel_n + MAX_VEL_REF_RATE);
-        float rate_limited_e = constrain_float(target_vel_e,
-            reference_state.vel_e - MAX_VEL_REF_RATE,
-            reference_state.vel_e + MAX_VEL_REF_RATE);
+        // Step 1: rate-limit N/E with L2-norm clip (fixes diagonal overshoot from per-component L∞)
+        float delta_n = target_vel_n - reference_state.vel_n;
+        float delta_e = target_vel_e - reference_state.vel_e;
+        float delta_ne_mag = sqrtf(delta_n * delta_n + delta_e * delta_e);
+        if (delta_ne_mag > MAX_VEL_REF_RATE) {
+            float scale = MAX_VEL_REF_RATE / delta_ne_mag;
+            delta_n *= scale;
+            delta_e *= scale;
+        }
+        float rate_limited_n = reference_state.vel_n + delta_n;
+        float rate_limited_e = reference_state.vel_e + delta_e;
+        // D (vertical) is independent of N/E horizontal plane, per-component is fine
         float rate_limited_d = constrain_float(target_vel_d,
             reference_state.vel_d - MAX_VEL_REF_RATE,
             reference_state.vel_d + MAX_VEL_REF_RATE);
