@@ -282,34 +282,48 @@ void ModeSmartPhoto99::run() {
             target_vel_e = companion_cmd.velocity_ned.y;
             target_vel_d = companion_cmd.velocity_ned.z;
         }
-        // Step 1: rate-limit N/E with L2-norm clip (fixes diagonal overshoot from per-component L∞)
-        float delta_n = target_vel_n - reference_state.vel_n;
-        float delta_e = target_vel_e - reference_state.vel_e;
-        float delta_ne_mag = sqrtf(delta_n * delta_n + delta_e * delta_e);
-        if (delta_ne_mag > MAX_VEL_REF_RATE) {
-            float scale = MAX_VEL_REF_RATE / delta_ne_mag;
-            delta_n *= scale;
-            delta_e *= scale;
-        }
-        float rate_limited_n = reference_state.vel_n + delta_n;
-        float rate_limited_e = reference_state.vel_e + delta_e;
-        // D (vertical) is independent of N/E horizontal plane, per-component is fine
-        float rate_limited_d = constrain_float(target_vel_d,
-            reference_state.vel_d - MAX_VEL_REF_RATE,
-            reference_state.vel_d + MAX_VEL_REF_RATE);
+        // Snap vel_ref to 0 immediately when companion sends 0 (tilt recovery).
+        // Python zeros vel_ref when tilt > 30°; C++ must receive it instantly so
+        // vel_error = actual_vel - 0 = full speed → maximum braking + leveling torque.
+        // Rate limiter and LP filter must NOT absorb this emergency stop signal.
+        const bool tilt_recovery = (fabsf(target_vel_n) < 1e-3f && fabsf(target_vel_e) < 1e-3f);
+        if (tilt_recovery) {
+            reference_state.vel_n = 0.0f;
+            reference_state.vel_e = 0.0f;
+            // Vertical still rate-limited (no emergency snap needed for D axis)
+            reference_state.vel_d = constrain_float(target_vel_d,
+                reference_state.vel_d - MAX_VEL_REF_RATE,
+                reference_state.vel_d + MAX_VEL_REF_RATE);
+        } else {
+            // Step 1: rate-limit N/E with L2-norm clip (fixes diagonal overshoot from per-component L∞)
+            float delta_n = target_vel_n - reference_state.vel_n;
+            float delta_e = target_vel_e - reference_state.vel_e;
+            float delta_ne_mag = sqrtf(delta_n * delta_n + delta_e * delta_e);
+            if (delta_ne_mag > MAX_VEL_REF_RATE) {
+                float scale = MAX_VEL_REF_RATE / delta_ne_mag;
+                delta_n *= scale;
+                delta_e *= scale;
+            }
+            float rate_limited_n = reference_state.vel_n + delta_n;
+            float rate_limited_e = reference_state.vel_e + delta_e;
+            // D (vertical) is independent of N/E horizontal plane, per-component is fine
+            float rate_limited_d = constrain_float(target_vel_d,
+                reference_state.vel_d - MAX_VEL_REF_RATE,
+                reference_state.vel_d + MAX_VEL_REF_RATE);
 
-        // Step 2: low-pass filter on reversal only
-        // When target flips sign vs current ref, apply exponential smoothing (α=0.3).
-        // Normal acceleration (same direction) passes through without smoothing.
-        const float LP_ALPHA = 0.3f;
-        auto apply_lp = [&](float rate_lim, float current, float target) -> float {
-            bool reversing = (target * current < 0.0f);
-            return reversing ? LP_ALPHA * rate_lim + (1.0f - LP_ALPHA) * current
-                             : rate_lim;
-        };
-        reference_state.vel_n = apply_lp(rate_limited_n, reference_state.vel_n, target_vel_n);
-        reference_state.vel_e = apply_lp(rate_limited_e, reference_state.vel_e, target_vel_e);
-        reference_state.vel_d = apply_lp(rate_limited_d, reference_state.vel_d, target_vel_d);
+            // Step 2: low-pass filter on reversal only
+            // When target flips sign vs current ref, apply exponential smoothing (α=0.3).
+            // Normal acceleration (same direction) passes through without smoothing.
+            const float LP_ALPHA = 0.3f;
+            auto apply_lp = [&](float rate_lim, float current, float target) -> float {
+                bool reversing = (target * current < 0.0f);
+                return reversing ? LP_ALPHA * rate_lim + (1.0f - LP_ALPHA) * current
+                                 : rate_lim;
+            };
+            reference_state.vel_n = apply_lp(rate_limited_n, reference_state.vel_n, target_vel_n);
+            reference_state.vel_e = apply_lp(rate_limited_e, reference_state.vel_e, target_vel_e);
+            reference_state.vel_d = apply_lp(rate_limited_d, reference_state.vel_d, target_vel_d);
+        }
 
         // Reference attitude: level flight at commanded yaw
         Quaternion q_ref;
@@ -1211,11 +1225,23 @@ void ModeSmartPhoto99::compute_lqi_control() {
     //   - Braking from 3 m/s: |u[2]| ≈ 2.0 Nm cap → tilt ≈ 22° → 3.7 m/s²
     //   - Both within safe recovery range before any FLIP
     //
-    // Hard-braking override: if actual speed > 1.5 * MAX (6.0 m/s), force vel_ref=0.
+    // Hard-braking override: if actual speed > 1.5 * MAX (3.0 m/s), force vel_ref=0.
     // This handles cases where the companion sends a non-zero vel_ref while overspeed.
-    const float MAX_HORIZ_SPEED_M = 4.0f;  // m/s — matches gym env MAX_VEL=4.0 (updated from 2.0)
-    const float M_MAX_ABS        = 2.0f;   // Nm — allows up to ~22° tilt for braking; sufficient restoring at 36°
+    const float MAX_HORIZ_SPEED_M = 2.0f;  // m/s — matches Python MAX_VEL_H=2.0; override at 3.0 m/s
+    // Context-dependent moment cap:
+    //   Normal flight (tilt ≤ 30°): 2.0 Nm → prevents aggressive tilt during velocity tracking
+    //   Recovery mode (tilt > 30°): 3.0 Nm → enough authority to overcome gravity during recovery
+    // Tilt angle from quaternion: cos(tilt) = 1 - 2*(q1²+q2²) for small angles,
+    //   or more accurately: tilt = acos(q0²-q1²-q2²+q3² clamped) — use z-axis dot product.
+    //   z_world_dot_z_body = q0²-q1²-q2²+q3² (= cos(tilt) for body z vs world z)
     {
+        float cq0 = current_state.q0, cq1 = current_state.q1;
+        float cq2 = current_state.q2, cq3 = current_state.q3;
+        float cos_tilt_m = cq0*cq0 - cq1*cq1 - cq2*cq2 + cq3*cq3;
+        cos_tilt_m = constrain_float(cos_tilt_m, -1.0f, 1.0f);
+        float tilt_deg_m = degrees(acosf(cos_tilt_m));
+        const float M_MAX_ABS = (tilt_deg_m > 30.0f) ? 3.0f : 2.0f;
+
         float hs_act = sqrtf(current_state.vel_n * current_state.vel_n +
                              current_state.vel_e * current_state.vel_e);
         if (hs_act > MAX_HORIZ_SPEED_M * 1.5f) {
