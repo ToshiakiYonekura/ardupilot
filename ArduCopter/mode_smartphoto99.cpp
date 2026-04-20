@@ -1254,7 +1254,13 @@ void ModeSmartPhoto99::compute_lqi_control() {
             u[1] -= lqr_gains.K[1][4] * reference_state.vel_e;  // -0.353 * vel_e = braking
         }
 
-        // Overall absolute cap: prevents extreme tilt in any direction
+        // Symmetric per-component bound: lower = -M_MAX_ABS, upper = +M_MAX_ABS.
+        // Prevents the negative side (nose-down) from being unbounded while the
+        // positive side is capped — both directions get the same absolute limit.
+        u[1] = constrain_float(u[1], -M_MAX_ABS, M_MAX_ABS);
+        u[2] = constrain_float(u[2], -M_MAX_ABS, M_MAX_ABS);
+
+        // L2-norm cap: bounds combined horizontal moment magnitude.
         float M_horiz = sqrtf(u[1]*u[1] + u[2]*u[2]);
         if (M_horiz > M_MAX_ABS) {
             float scale = M_MAX_ABS / M_horiz;
